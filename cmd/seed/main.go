@@ -526,30 +526,48 @@ func (s *seeder) seedTasks(ctx context.Context) error {
 		// Dependencies only ever point at an earlier task inside the same block of
 		// eight, so the graph is acyclic by construction and its depth stays
 		// shallow enough for the closure to remain linear in the task count.
+		//
+		// The edge count is a sizing parameter, not an accident: the brief tests at
+		// 1,000,000 edges over 500,000 tasks, so ~2 per task. Always taking the
+		// previous task and then topping up with random earlier tasks in the block
+		// averages 2.125 (0, 1, 2, 2, 3, 3, 3, 3 across the eight positions), which
+		// lands just above the floor instead of under it. Depth is unaffected
+		// because every target is still inside the block.
 		seen := map[[2]uuid.UUID]bool{}
 		for i := range tasks {
 			blockStart := (i / blockSize) * blockSize
-			add := func(target int) {
+			position := i - blockStart
+			add := func(target int) bool {
 				if target < 0 || target >= i {
-					return
+					return false
 				}
 				key := [2]uuid.UUID{tasks[i].ID, tasks[target].ID}
 				if seen[key] {
-					return
+					return false
 				}
 				seen[key] = true
 				depBatch = append(depBatch, database.TaskDep{
 					ProjectID: p.ID, TaskID: tasks[i].ID, DependsOnID: tasks[target].ID, CreatedAt: now,
 				})
+				return true
 			}
-			if i > blockStart {
-				add(i - 1)
+			if position == 0 {
+				continue
 			}
-			if i-blockStart >= 3 && s.rnd.Intn(100) < 55 {
-				add(i - 3)
+			add(i - 1)
+			extra := 0
+			if position >= 4 {
+				extra = 2
+			} else if position >= 2 {
+				extra = 1
 			}
-			if i-blockStart >= 2 && s.rnd.Intn(100) < 45 {
-				add(blockStart + s.rnd.Intn(i-blockStart))
+			// Bounded retry: a random target can collide with the previous task
+			// already added, and on a three-task block there is little to choose
+			// from.
+			for added, attempt := 0, 0; added < extra && attempt < 12; attempt++ {
+				if add(blockStart + s.rnd.Intn(position)) {
+					added++
+				}
 			}
 		}
 
@@ -752,13 +770,34 @@ func (s *seeder) seedDeliveries(ctx context.Context) error {
 		}
 		deliveries = append(deliveries, d)
 
-		// 2 to 13 distinct materials per delivery, ~7.5 on average.
-		nLines := 2 + s.rnd.Intn(12)
+		// 2 to 14 distinct materials per delivery, 8 on average. The brief sizes the
+		// test data at 400,000 deliveries holding 3,000,000 lines, which is exactly
+		// 7.5 each - so a 7.5 mean would sit on the floor and dip below it half the
+		// time. 8 keeps it above.
+		//
+		// A delivery used to stop early when the project stocked fewer materials
+		// than it wanted, which is where the last few thousand lines went missing;
+		// it now tops up from the catalogue so the count per delivery is real.
+		nLines := 2 + s.rnd.Intn(13)
+		if nLines > len(s.materials) {
+			nLines = len(s.materials)
+		}
 		used := map[int]bool{}
-		for len(used) < nLines && len(used) < len(p.Stocked) {
+		for len(used) < nLines {
 			idx := p.Stocked[s.rnd.Intn(len(p.Stocked))]
 			if used[idx] {
-				continue
+				// Linear probe rather than another random draw: on a project that
+				// stocks a handful of materials, random retries would spin.
+				for probe := 1; probe < len(s.materials); probe++ {
+					candidate := (idx + probe) % len(s.materials)
+					if !used[candidate] {
+						idx = candidate
+						break
+					}
+				}
+				if used[idx] {
+					break
+				}
 			}
 			used[idx] = true
 			lines = append(lines, database.DeliveryLine{
