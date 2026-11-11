@@ -1,0 +1,65 @@
+# docker compose up brings the whole thing up: database, migrations and API.
+# Nothing else has to be installed or run.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sitetrack
+      POSTGRES_PASSWORD: sitetrack
+      POSTGRES_DB: sitetrack
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - effective_cache_size=768MB
+      # The dataset is bigger than RAM on a small box, so random reads matter.
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - maintenance_work_mem=128MB
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sitetrack -d sitetrack"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgres://sitetrack:sitetrack@db:5432/sitetrack?sslmode=disable
+      JWT_SECRET: ${JWT_SECRET:-dev-only-secret-change-me-1234567890}
+      ADDR: ":8080"
+      ACCESS_TOKEN_TTL: ${ACCESS_TOKEN_TTL:-15m}
+      REFRESH_TOKEN_TTL: ${REFRESH_TOKEN_TTL:-720h}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8080}:8080"
+    restart: unless-stopped
+
+  # Optional helper: `docker compose run --rm seed --reset` fills the database at
+  # the volume described in the brief. Kept out of the default `up` on purpose.
+  seed:
+    build: .
+    entrypoint: ["/app/seed"]
+    profiles: ["tools"]
+    environment:
+      DATABASE_URL: postgres://sitetrack:sitetrack@db:5432/sitetrack?sslmode=disable
+      JWT_SECRET: ${JWT_SECRET:-dev-only-secret-change-me-1234567890}
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
