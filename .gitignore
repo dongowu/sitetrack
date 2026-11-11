@@ -1,0 +1,5 @@
+.env
+/bin
+/sitetrack
+*.test
+.DS_Store
