@@ -150,14 +150,31 @@ transitive closure.
 
 ## Decisions worth explaining
 
-**GORM for the model layer, hand-written SQL for six queries.** Models, CRUD,
-transactions, upserts (`ON CONFLICT`) and row locks (`clause.Locking`) are all
-GORM. Six queries stay as SQL because that is the tool for the job: the project
-roll-up (a CTE with `FILTER` aggregates and a window count), the task list (two
-derived flags per row plus a window count), the blocked-count aggregate, the
-closure insert, the closure rebuild sweep and the per-store in-transit sum.
-Writing those in builder style would be slower to read and, in the closure case,
-impossible to express.
+**Every runtime query goes through GORM.** Models, CRUD, transactions, upserts
+(`clause.OnConflict`), row locks (`clause.Locking`), `RETURNING`
+(`clause.Returning`), subqueries and the analytic reads are all builder calls.
+The two list screens are still one statement each: a window function like
+`count(*) OVER ()` and an aggregate like `count(*) FILTER (...)` are expressions,
+so they ride along in `Select` while the filtering, grouping, ordering and paging
+stay builder operations. The blocked-count roll-up is a `Model` with two `Joins`
+and a `Group`, and the task's derived Late/Blocked flags are computed inside the
+subquery the builder assembles.
+
+Four statements are still text, and each is marked where it appears:
+
+* the body of a migration file, which is arbitrary DDL by definition;
+* `SELECT nextval('project_seq')` — calling a sequence is not a builder
+  operation, and replacing it with a counter row would mean reimplementing one
+  inside a transaction;
+* two `INSERT ... SELECT` statements that close and rebuild the transitive
+  closure. GORM has no builder for `INSERT ... SELECT`, and the alternative is one
+  `Create` per pair, which is tens of thousands of round trips on a project with
+  3,000 tasks.
+
+The seeder follows the same rule: it loads with `CreateInBatches` rather than row
+by row, and only its reset step (`TRUNCATE`, `ALTER SEQUENCE`, `setval`, one
+`UPDATE ... FROM` backfill) and the global closure sweep are text, for the same
+reasons.
 
 **The schema lives in `migrations/*.sql`, not `AutoMigrate`.** Four of the
 guarantees the brief grades cannot be expressed with struct tags: the partial
@@ -228,27 +245,30 @@ API and Postgres in Docker on the same host:
 
 | endpoint | median | rows / total |
 | --- | --- | --- |
-| `GET /projects` | 159 ms | 20 / 2002 |
-| `GET /projects?sort=late_tasks&dir=desc` | 162 ms | 20 / 2002 |
-| `GET /projects?offset=1000` | 105 ms | 20 / 2002 |
+| `GET /projects` | 87 ms | 20 / 2003 |
+| `GET /projects?sort=late_tasks&dir=desc` | 92 ms | 20 / 2003 |
+| `GET /projects?offset=1000` | 65 ms | 20 / 2003 |
 | `GET /projects/PRJ-0002` | 19 ms | 1 |
-| `GET /projects/PRJ-0002/tasks` (3,000-task project) | 6 ms | 20 / 3000 |
-| `…/tasks?blocked=true` | 9 ms | 20 / 2136 |
-| `GET /projects/PRJ-0002/tasks/PRJ-0002-T-3000` | 5 ms | 1 |
-| `GET /projects/PRJ-0002/store` | 6 ms | 20 / 321 |
-| `GET /projects/PRJ-0002/deliveries` | 6 ms | 20 / 205 |
-| `GET /company/store` | 14 ms | 20 / 20002 |
-| `GET /company/store?status=low_stock` | 12 ms | 20 / 1160 |
-| `GET /company/deliveries` | 60 ms | 20 / 400000 |
-| `GET /materials` | 2 ms | 20 / 20002 |
+| `GET /projects/PRJ-0002/tasks` (3,000-task project) | 5 ms | 20 / 3000 |
+| `…/tasks?blocked=true` | 14 ms | 20 / 2136 |
+| `GET /projects/PRJ-0002/tasks/PRJ-0002-T-3000` | 4 ms | 1 |
+| `GET /projects/PRJ-0002/store` | 8 ms | 20 / 321 |
+| `GET /projects/PRJ-0002/deliveries` | 8 ms | 20 / 205 |
+| `GET /company/store` | 15 ms | 20 / 20003 |
+| `GET /company/store?status=low_stock` | 15 ms | 20 / 1160 |
+| `GET /company/deliveries` | 58 ms | 20 / 400000 |
+| `GET /materials` | 2 ms | 20 / 20003 |
 | `GET /me` | 4 ms | 1 |
-| `GET /notifications` | 5 ms | 13 / 13 |
+| `GET /notifications` | 4 ms | 13 / 13 |
 
-The project list is the slowest read at ~160 ms, and that is honest about what it
+The project list is the slowest read at ~90 ms, and that is honest about what it
 does: to show a percentage-done and a late count for every project it has to
 aggregate all 500,000 tasks, and to show blocked counts it walks 1,000,000
 closure rows for the page. Splitting the work (aggregate everything, then compute
-blocked for 20 rows only) is what keeps it out of the seconds.
+blocked for 20 rows only) is what keeps it out of the seconds. It also got about
+twice as fast when the visibility rule moved from `WHERE ? = 'superadmin' OR
+member.user_id IS NOT NULL` — which the planner cannot push down — into a
+conditional join plus a conditional `Where`.
 
 Two things were slow enough on the first pass to be worth fixing, and both are
 worth recording because the naive versions look fine:

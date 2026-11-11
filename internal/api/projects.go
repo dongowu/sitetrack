@@ -12,6 +12,7 @@ import (
 	"github.com/dongowu/sitetrack/internal/httpx"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type projectAccess struct {
@@ -164,6 +165,9 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// nextval never returns the same number twice and never reuses one, so a
 		// deleted project's code is gone for good even under concurrent creation.
+		// This is the only statement in the API left as text: calling a sequence is
+		// not a builder operation, and swapping the sequence for a counter row would
+		// mean reimplementing one inside a transaction for no gain.
 		if err := tx.Raw(`SELECT nextval('project_seq')`).Row().Scan(&project.Seq); err != nil {
 			return err
 		}
@@ -173,7 +177,7 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		}
 		storeID := uuid.New()
 		if err := tx.Create(&database.Store{
-			ID: storeID, Kind: "project", ProjectID: &project.ID, CreatedAt: time.Now().UTC(),
+			ID: storeID, Kind: database.StoreKindProject, ProjectID: &project.ID, CreatedAt: time.Now().UTC(),
 		}).Error; err != nil {
 			return err
 		}
@@ -195,6 +199,7 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 
 type projectListRow struct {
 	ID           string    `gorm:"column:id"`
+	UID          uuid.UUID `gorm:"column:uid"`
 	Name         string    `gorm:"column:name"`
 	PlannedStart string    `gorm:"column:planned_start"`
 	PlannedEnd   string    `gorm:"column:planned_end"`
@@ -209,9 +214,53 @@ type projectListRow struct {
 	TotalRows    int       `gorm:"column:total_rows"`
 }
 
-// handleListProjects keeps one hand-written query: paging, the per project task
-// roll up and the sort order all have to happen in the database, otherwise the
-// screen needs one query per project.
+// visibleProjects is the row set every project screen starts from: the projects
+// the caller may see, plus whether they administer each one. A superadmin needs
+// no membership filter; for everyone else the join itself is the filter.
+func (s *Server) visibleProjects(db *gorm.DB, p *Principal) *gorm.DB {
+	q := db.Model(&database.Project{}).
+		Select(`projects.id, projects.code, projects.name, projects.planned_start,
+		        projects.planned_end, projects.created_at,
+		        COALESCE(project_members.is_admin, false) AS is_admin`).
+		Joins("LEFT JOIN project_members ON project_members.project_id = projects.id AND project_members.user_id = ?",
+			p.UserID)
+	if !p.IsSuperAdmin() {
+		q = q.Where("project_members.user_id IS NOT NULL")
+	}
+	return q
+}
+
+// visibleProjectIDs is the same set narrowed to the primary key, which is what
+// the roll ups below filter on.
+func (s *Server) visibleProjectIDs(db *gorm.DB, p *Principal) *gorm.DB {
+	return s.visibleProjects(db, p).Select("projects.id")
+}
+
+// taskRollupExpr counts a project's tasks by state in one pass. FILTER is a
+// Postgres aggregate modifier with no builder equivalent, so it travels as an
+// expression while the grouping and the scope stay builder calls. Late is
+// derived exactly as the brief defines it: not done, and either past its planned
+// end or not started past its planned start.
+const taskRollupExpr = `count(*) AS total,
+	count(*) FILTER (WHERE status = 'not_started') AS not_started,
+	count(*) FILTER (WHERE status = 'in_progress') AS in_progress,
+	count(*) FILTER (WHERE status = 'done') AS done,
+	count(*) FILTER (WHERE status <> 'done'
+		AND (planned_end < current_date
+		     OR (status = 'not_started' AND planned_start < current_date))) AS late`
+
+// taskRollup groups taskRollupExpr per project, restricted to the visible set so
+// the aggregate never touches a project the caller cannot see.
+func (s *Server) taskRollup(db *gorm.DB, p *Principal) *gorm.DB {
+	return db.Model(&database.Task{}).
+		Select("project_id, "+taskRollupExpr).
+		Where("project_id IN (?)", s.visibleProjectIDs(db, p)).
+		Group("project_id")
+}
+
+// handleListProjects answers with one statement: the page, the per project task
+// roll up, the member count and the total row count come back together, because
+// the alternative is one query per project on the screen.
 func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 	p := caller(r)
 	pg := s.paging(r)
@@ -236,62 +285,49 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	db := s.db.WithContext(ctx)
+
+	query := db.
+		Table("(?) AS v", s.visibleProjects(db, p)).
+		Joins("LEFT JOIN (?) AS ts ON ts.project_id = v.id", s.taskRollup(db, p)).
+		Joins("LEFT JOIN (?) AS ms ON ms.project_id = v.id",
+			db.Model(&database.ProjectMember{}).
+				Select("project_id, count(*) AS member_count").
+				Where("project_id IN (?)", s.visibleProjectIDs(db, p)).
+				Group("project_id")).
+		Select(`v.code AS id, v.id AS uid, v.name,
+		        to_char(v.planned_start, 'YYYY-MM-DD') AS planned_start,
+		        to_char(v.planned_end, 'YYYY-MM-DD') AS planned_end,
+		        v.created_at, v.is_admin,
+		        COALESCE(ms.member_count, 0) AS member_count,
+		        COALESCE(ts.total, 0) AS total,
+		        COALESCE(ts.not_started, 0) AS not_started,
+		        COALESCE(ts.in_progress, 0) AS in_progress,
+		        COALESCE(ts.done, 0) AS done,
+		        COALESCE(ts.late, 0) AS late,
+		        count(*) OVER () AS total_rows`)
+
+	if search != "" {
+		query = query.Where("v.code ILIKE ? OR lower(v.name) LIKE ?", search, search)
+	}
+	if hasLate {
+		query = query.Where("COALESCE(ts.late, 0) > 0")
+	}
+
 	var rows []projectListRow
-	err := s.db.WithContext(ctx).Raw(`
-		WITH visible AS (
-			SELECT p.id, p.code, p.name, p.planned_start, p.planned_end, p.created_at,
-			       COALESCE(m.is_admin, false) AS is_admin
-			FROM projects p
-			LEFT JOIN project_members m ON m.project_id = p.id AND m.user_id = ?
-			WHERE ? = 'superadmin' OR m.user_id IS NOT NULL
-		),
-		task_stats AS (
-			SELECT t.project_id,
-			       count(*) AS total,
-			       count(*) FILTER (WHERE t.status = 'not_started') AS not_started,
-			       count(*) FILTER (WHERE t.status = 'in_progress') AS in_progress,
-			       count(*) FILTER (WHERE t.status = 'done') AS done,
-			       count(*) FILTER (
-			           WHERE t.status <> 'done'
-			             AND (t.planned_end < current_date
-			                  OR (t.status = 'not_started' AND t.planned_start < current_date))
-			       ) AS late
-			FROM tasks t
-			WHERE t.project_id IN (SELECT id FROM visible)
-			GROUP BY t.project_id
-		),
-		member_stats AS (
-			SELECT pm.project_id, count(*) AS member_count
-			FROM project_members pm
-			WHERE pm.project_id IN (SELECT id FROM visible)
-			GROUP BY pm.project_id
-		)
-		SELECT v.code AS id, v.name,
-		       to_char(v.planned_start, 'YYYY-MM-DD') AS planned_start,
-		       to_char(v.planned_end, 'YYYY-MM-DD') AS planned_end,
-		       v.created_at, v.is_admin,
-		       COALESCE(ms.member_count, 0) AS member_count,
-		       COALESCE(ts.total, 0) AS total,
-		       COALESCE(ts.not_started, 0) AS not_started,
-		       COALESCE(ts.in_progress, 0) AS in_progress,
-		       COALESCE(ts.done, 0) AS done,
-		       COALESCE(ts.late, 0) AS late,
-		       count(*) OVER () AS total_rows
-		FROM visible v
-		LEFT JOIN task_stats ts ON ts.project_id = v.id
-		LEFT JOIN member_stats ms ON ms.project_id = v.id
-		WHERE (? = '' OR v.code ILIKE ? OR lower(v.name) LIKE ?)
-		  AND (? = false OR COALESCE(ts.late, 0) > 0)
-		ORDER BY `+expr+` `+direction(queryParam(r, "dir"))+`, v.code ASC
-		LIMIT ? OFFSET ?`,
-		p.UserID, p.Role, search, search, search, hasLate, pg.Limit, pg.Offset).Scan(&rows).Error
-	if err != nil {
+	if err := query.
+		Clauses(clause.OrderBy{Expression: clause.Expr{
+			SQL:                expr + " " + direction(queryParam(r, "dir")) + ", v.code ASC",
+			WithoutParentheses: true,
+		}}).
+		Limit(pg.Limit).Offset(pg.Offset).
+		Scan(&rows).Error; err != nil {
 		httpx.Fail(w, r, httpx.Internal(err))
 		return
 	}
 
 	items := make([]projectDTO, 0, len(rows))
-	codes := make([]string, 0, len(rows))
+	ids := make([]uuid.UUID, 0, len(rows))
 	for _, row := range rows {
 		d := projectDTO{
 			ID: row.ID, Name: row.Name, PlannedStart: row.PlannedStart, PlannedEnd: row.PlannedEnd,
@@ -302,19 +338,19 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 			PercentDone:   percentDone(row.Done, row.Total),
 		}
 		items = append(items, d)
-		codes = append(codes, row.ID)
+		ids = append(ids, row.UID)
 	}
 
 	// Blocked counts are only needed for the rows on this page, so they are not
 	// part of the big aggregate above.
-	if len(codes) > 0 {
-		blocked, err := s.blockedCountsByCode(ctx, codes)
+	if len(ids) > 0 {
+		blocked, err := s.blockedTaskCounts(ctx, ids)
 		if err != nil {
 			httpx.Fail(w, r, httpx.Internal(err))
 			return
 		}
 		for i := range items {
-			items[i].BlockedTaskCount = blocked[items[i].ID]
+			items[i].BlockedTaskCount = blocked[ids[i]]
 		}
 	}
 
@@ -330,25 +366,30 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) blockedCountsByCode(ctx context.Context, codes []string) (map[string]int, error) {
+// blockedTaskCounts answers "how many tasks are waiting on something that is not
+// done" for a set of projects. A task counts once however many unfinished
+// ancestors it has, hence the distinct; the two joins simply drop pairs where
+// either end is already finished.
+func (s *Server) blockedTaskCounts(ctx context.Context, projectIDs []uuid.UUID) (map[uuid.UUID]int, error) {
 	var rows []struct {
-		Code    string `gorm:"column:code"`
-		Blocked int    `gorm:"column:blocked"`
+		ProjectID uuid.UUID `gorm:"column:project_id"`
+		Blocked   int       `gorm:"column:blocked"`
 	}
-	err := s.db.WithContext(ctx).Raw(`
-		SELECT p.code, count(DISTINCT c.descendant_id) AS blocked
-		FROM task_closure c
-		JOIN projects p ON p.id = c.project_id
-		JOIN tasks a ON a.id = c.ancestor_id AND a.status <> 'done'
-		JOIN tasks d ON d.id = c.descendant_id AND d.status <> 'done'
-		WHERE p.code IN ?
-		GROUP BY p.code`, codes).Scan(&rows).Error
+	err := s.db.WithContext(ctx).
+		Model(&database.TaskClosure{}).
+		Select("task_closure.project_id, count(DISTINCT task_closure.descendant_id) AS blocked").
+		Joins("JOIN tasks AS ancestor ON ancestor.id = task_closure.ancestor_id AND ancestor.status <> ?", statusDone).
+		Joins("JOIN tasks AS descendant ON descendant.id = task_closure.descendant_id AND descendant.status <> ?", statusDone).
+		Where("task_closure.project_id IN ?", projectIDs).
+		Group("task_closure.project_id").
+		Scan(&rows).Error
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]int{}
+
+	out := make(map[uuid.UUID]int, len(rows))
 	for _, row := range rows {
-		out[row.Code] = row.Blocked
+		out[row.ProjectID] = row.Blocked
 	}
 	return out, nil
 }
@@ -359,13 +400,16 @@ type projectDetailRow struct {
 	PlannedStart string    `gorm:"column:planned_start"`
 	PlannedEnd   string    `gorm:"column:planned_end"`
 	CreatedAt    time.Time `gorm:"column:created_at"`
-	MemberCount  int       `gorm:"column:member_count"`
-	Total        int       `gorm:"column:total"`
-	NotStarted   int       `gorm:"column:not_started"`
-	InProgress   int       `gorm:"column:in_progress"`
-	Done         int       `gorm:"column:done"`
-	Late         int       `gorm:"column:late"`
-	Blocked      int       `gorm:"column:blocked"`
+}
+
+// projectTaskRollup is the shape of taskRollupExpr when it is aimed at a single
+// project: one row, no grouping.
+type projectTaskRollup struct {
+	Total      int `gorm:"column:total"`
+	NotStarted int `gorm:"column:not_started"`
+	InProgress int `gorm:"column:in_progress"`
+	Done       int `gorm:"column:done"`
+	Late       int `gorm:"column:late"`
 }
 
 func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
@@ -375,26 +419,42 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, r, err)
 		return
 	}
+	ctx := r.Context()
+	db := s.db.WithContext(ctx)
 
 	var row projectDetailRow
-	err = s.db.WithContext(r.Context()).Raw(`
-		SELECT p.code, p.name,
-		       to_char(p.planned_start, 'YYYY-MM-DD') AS planned_start,
-		       to_char(p.planned_end, 'YYYY-MM-DD') AS planned_end,
-		       p.created_at,
-		       (SELECT count(*) FROM project_members WHERE project_id = p.id) AS member_count,
-		       (SELECT count(*) FROM tasks WHERE project_id = p.id) AS total,
-		       (SELECT count(*) FROM tasks WHERE project_id = p.id AND status = 'not_started') AS not_started,
-		       (SELECT count(*) FROM tasks WHERE project_id = p.id AND status = 'in_progress') AS in_progress,
-		       (SELECT count(*) FROM tasks WHERE project_id = p.id AND status = 'done') AS done,
-		       (SELECT count(*) FROM tasks WHERE project_id = p.id AND status <> 'done'
-		           AND (planned_end < current_date
-		                OR (status = 'not_started' AND planned_start < current_date))) AS late,
-		       (SELECT count(DISTINCT c.descendant_id) FROM task_closure c
-		           JOIN tasks x ON x.id = c.ancestor_id AND x.status <> 'done'
-		           JOIN tasks y ON y.id = c.descendant_id AND y.status <> 'done'
-		           WHERE c.project_id = p.id) AS blocked
-		FROM projects p WHERE p.id = ?`, a.ID).Scan(&row).Error
+	if err := db.Model(&database.Project{}).
+		Select(`projects.code, projects.name,
+		        to_char(projects.planned_start, 'YYYY-MM-DD') AS planned_start,
+		        to_char(projects.planned_end, 'YYYY-MM-DD') AS planned_end,
+		        projects.created_at`).
+		Where("projects.id = ?", a.ID).
+		Scan(&row).Error; err != nil {
+		httpx.Fail(w, r, httpx.Internal(err))
+		return
+	}
+
+	// The three roll ups below are separate statements instead of seven correlated
+	// subqueries. Each one is a single indexed aggregate, and the split keeps every
+	// counter expressed as a GORM query rather than a string inside another query.
+	var counts projectTaskRollup
+	if err := db.Model(&database.Task{}).
+		Select(taskRollupExpr).
+		Where("project_id = ?", a.ID).
+		Scan(&counts).Error; err != nil {
+		httpx.Fail(w, r, httpx.Internal(err))
+		return
+	}
+
+	var members int64
+	if err := db.Model(&database.ProjectMember{}).
+		Where("project_id = ?", a.ID).
+		Count(&members).Error; err != nil {
+		httpx.Fail(w, r, httpx.Internal(err))
+		return
+	}
+
+	blocked, err := s.blockedTaskCounts(ctx, []uuid.UUID{a.ID})
 	if err != nil {
 		httpx.Fail(w, r, httpx.Internal(err))
 		return
@@ -402,12 +462,12 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 
 	httpx.OK(w, projectDTO{
 		ID: row.Code, Name: row.Name, PlannedStart: row.PlannedStart, PlannedEnd: row.PlannedEnd,
-		IsProjectAdmin: a.IsAdmin, MemberCount: row.MemberCount,
-		TaskCounts: taskCounts{Total: row.Total, NotStarted: row.NotStarted,
-			InProgress: row.InProgress, Done: row.Done},
-		PercentDone:      percentDone(row.Done, row.Total),
-		LateTaskCount:    row.Late,
-		BlockedTaskCount: row.Blocked,
+		IsProjectAdmin: a.IsAdmin, MemberCount: int(members),
+		TaskCounts: taskCounts{Total: counts.Total, NotStarted: counts.NotStarted,
+			InProgress: counts.InProgress, Done: counts.Done},
+		PercentDone:      percentDone(counts.Done, counts.Total),
+		LateTaskCount:    counts.Late,
+		BlockedTaskCount: blocked[a.ID],
 		CreatedAt:        row.CreatedAt,
 	})
 }

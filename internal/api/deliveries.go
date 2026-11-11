@@ -271,16 +271,13 @@ func (s *Server) handleProjectCreateDelivery(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		// The company store row must exist, but a project member is allowed to
 		// send material back to it without being a store manager.
-		var storeIDStr string
-		if err := s.db.WithContext(r.Context()).Table("stores").Select("id").
-			Where("kind = 'company'").Row().Scan(&storeIDStr); err != nil {
+		var company database.Store
+		if err := s.db.WithContext(r.Context()).Select("id").
+			Where("kind = ?", database.StoreKindCompany).Take(&company).Error; err != nil {
 			httpx.Fail(w, r, httpx.Internal(errors.New("company store is missing")))
 			return
 		}
-		if companyStoreID, err = uuid.Parse(storeIDStr); err != nil {
-			httpx.Fail(w, r, httpx.Internal(errors.New("company store is missing")))
-			return
-		}
+		companyStoreID = company.ID
 	}
 
 	d, err := s.createDelivery(r.Context(), p, deliveryCreate{

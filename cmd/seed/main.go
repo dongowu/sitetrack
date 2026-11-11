@@ -306,7 +306,7 @@ func (s *seeder) seedProjects(ctx context.Context) error {
 		s.projects = append(s.projects, project{Project: p, StoreID: storeID})
 		rows = append(rows, p)
 		stores = append(stores, database.Store{
-			ID: storeID, Kind: "project", ProjectID: &s.projects[i].ID, CreatedAt: now,
+			ID: storeID, Kind: database.StoreKindProject, ProjectID: &s.projects[i].ID, CreatedAt: now,
 		})
 	}
 
@@ -317,16 +317,15 @@ func (s *seeder) seedProjects(ctx context.Context) error {
 		return err
 	}
 
-	var companyStoreID string
-	if err := s.db.WithContext(ctx).Table("stores").Select("id").
-		Where("kind = 'company'").Row().Scan(&companyStoreID); err != nil {
+	var company database.Store
+	if err := s.db.WithContext(ctx).Select("id").
+		Where("kind = ?", database.StoreKindCompany).Take(&company).Error; err != nil {
 		return err
 	}
-	companyStore, err := uuid.Parse(companyStoreID)
-	if err != nil {
-		return err
-	}
-	s.companyStore = companyStore
+	s.companyStore = company.ID
+	// setval has no builder equivalent: the seeder rewound the sequence above so
+	// the generated codes start at PRJ-0001, and this puts it back past the rows
+	// it just wrote.
 	return s.db.WithContext(ctx).Exec(`SELECT setval('project_seq', ?)`, len(s.projects)).Error
 }
 

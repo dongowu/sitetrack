@@ -71,9 +71,23 @@ type taskListRow struct {
 	TotalRows    int        `gorm:"column:total_rows"`
 }
 
-// handleListTasks keeps one hand-written query: the Late and Blocked flags are
-// derived per row from the closure table, and doing that in Go would mean one
-// extra round trip per task on a project with 3,000 of them.
+// taskFlagsExpr derives Late and Blocked for one task row. Both are derived
+// states in the brief and are never stored, so they are computed by the query
+// that reads them. Late is a date comparison; Blocked is an existence test
+// against the closure table, which is what makes "waiting on something that is
+// not done" a property of transitive dependencies rather than direct ones.
+var taskFlagsExpr = fmt.Sprintf(`(tasks.status <> '%[1]s' AND (tasks.planned_end < current_date
+			OR (tasks.status = '%[2]s' AND tasks.planned_start < current_date))) AS is_late,
+		(tasks.status <> '%[1]s' AND EXISTS (
+			SELECT 1 FROM task_closure
+			JOIN tasks AS ancestor ON ancestor.id = task_closure.ancestor_id AND ancestor.status <> '%[1]s'
+			WHERE task_closure.descendant_id = tasks.id)) AS is_blocked,
+		(SELECT count(*) FROM task_deps WHERE task_deps.depends_on_id = tasks.id) AS dependents`,
+	statusDone, statusNotStarted)
+
+// handleListTasks answers with one statement: the flags, the dependent count,
+// the filters and the total row count are all resolved in the database, because
+// doing any of them in Go means one round trip per task on a project with 3,000.
 func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	p := caller(r)
 	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), false)
@@ -116,43 +130,45 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	db := s.db.WithContext(ctx)
+
+	base := db.Model(&database.Task{}).
+		Select(`tasks.id, tasks.code, tasks.name, tasks.seq, tasks.planned_start,
+		        tasks.planned_end, tasks.status, tasks.started_at, tasks.done_at, `+taskFlagsExpr).
+		Where("tasks.project_id = ?", a.ID)
+
+	query := db.Table("(?) AS base", base).
+		Select(`base.id, base.code, base.name, base.planned_start, base.planned_end,
+		        base.status, base.started_at, base.done_at, base.is_late, base.is_blocked,
+		        base.dependents, count(*) OVER () AS total_rows`)
+
+	if status != "" {
+		query = query.Where("base.status = ?", status)
+	}
+	if boolParam(r, "late") {
+		query = query.Where("base.is_late")
+	}
+	if boolParam(r, "blocked") {
+		query = query.Where("base.is_blocked")
+	}
+	if from != nil {
+		query = query.Where("base.planned_end >= ?::date", *from)
+	}
+	if to != nil {
+		query = query.Where("base.planned_start <= ?::date", *to)
+	}
+	if search != "" {
+		query = query.Where("base.code ILIKE ? OR lower(base.name) LIKE ?", search, search)
+	}
+
 	var rows []taskListRow
-	err = s.db.WithContext(ctx).Raw(`
-		WITH base AS (
-			SELECT t.id, t.code, t.name, t.seq, t.planned_start, t.planned_end, t.status,
-			       t.started_at, t.done_at,
-			       (t.status <> 'done' AND (
-			            t.planned_end < current_date
-			            OR (t.status = 'not_started' AND t.planned_start < current_date))) AS is_late,
-			       (t.status <> 'done' AND EXISTS (
-			            SELECT 1 FROM task_closure c
-			            JOIN tasks anc ON anc.id = c.ancestor_id AND anc.status <> 'done'
-			            WHERE c.descendant_id = t.id)) AS is_blocked,
-			       (SELECT count(*) FROM task_deps d WHERE d.depends_on_id = t.id) AS dependents
-			FROM tasks t
-			WHERE t.project_id = ?
-		)
-		SELECT id, code, name, planned_start, planned_end, status, started_at, done_at,
-		       is_late, is_blocked, dependents,
-		       count(*) OVER () AS total_rows
-		FROM base
-		WHERE (? = '' OR status = ?)
-		  AND (? = false OR is_late)
-		  AND (? = false OR is_blocked)
-		  AND (?::date IS NULL OR planned_end >= ?::date)
-		  AND (?::date IS NULL OR planned_start <= ?::date)
-		  AND (? = '' OR code ILIKE ? OR lower(name) LIKE ?)
-		ORDER BY `+expr+` `+direction(queryParam(r, "dir"))+`, seq ASC
-		LIMIT ? OFFSET ?`,
-		a.ID,
-		status, status,
-		boolParam(r, "late"),
-		boolParam(r, "blocked"),
-		from, from,
-		to, to,
-		search, search, search,
-		pg.Limit, pg.Offset).Scan(&rows).Error
-	if err != nil {
+	if err := query.
+		Clauses(clause.OrderBy{Expression: clause.Expr{
+			SQL:                expr + " " + direction(queryParam(r, "dir")) + ", seq ASC",
+			WithoutParentheses: true,
+		}}).
+		Limit(pg.Limit).Offset(pg.Offset).
+		Scan(&rows).Error; err != nil {
 		httpx.Fail(w, r, httpx.Internal(err))
 		return
 	}
@@ -204,13 +220,14 @@ func (s *Server) directDependencies(ctx context.Context, ids []uuid.UUID) (map[s
 		TaskCode    string    `gorm:"column:task_code"`
 		DependsCode string    `gorm:"column:depends_code"`
 	}
-	err := s.db.WithContext(ctx).Raw(`
-		SELECT d.task_id, t.code AS task_code, dep.code AS depends_code
-		FROM task_deps d
-		JOIN tasks t ON t.id = d.task_id
-		JOIN tasks dep ON dep.id = d.depends_on_id
-		WHERE d.task_id IN ?
-		ORDER BY dep.code`, ids).Scan(&rows).Error
+	err := s.db.WithContext(ctx).
+		Model(&database.TaskDep{}).
+		Select(`task_deps.task_id, task.code AS task_code, dependency.code AS depends_code`).
+		Joins("JOIN tasks AS task ON task.id = task_deps.task_id").
+		Joins("JOIN tasks AS dependency ON dependency.id = task_deps.depends_on_id").
+		Where("task_deps.task_id IN ?", ids).
+		Clauses(ordering("dependency.code", "ASC")).
+		Scan(&rows).Error
 	if err != nil {
 		return nil, err
 	}
@@ -266,10 +283,16 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		// row lock is held until commit, so concurrent creators queue instead of
 		// colliding. A rolled back transaction also rolls the counter back, which
 		// is why no number is ever burned without producing a task.
-		var seq int
-		if err := tx.Raw(`UPDATE projects SET task_seq = task_seq + 1 WHERE id = ? RETURNING task_seq`,
-			a.ID).Row().Scan(&seq); err != nil {
+		var project database.Project
+		if err := tx.Model(&project).
+			Clauses(clause.Returning{Columns: []clause.Column{{Name: "task_seq"}}}).
+			Where("id = ?", a.ID).
+			UpdateColumn("task_seq", gorm.Expr("task_seq + 1")).Error; err != nil {
 			return err
+		}
+		seq := project.TaskSeq
+		if seq == 0 {
+			return httpx.Internal(errors.New("task sequence was not handed out"))
 		}
 		task = database.Task{
 			ID:           uuid.New(),
@@ -331,86 +354,84 @@ type taskDetail struct {
 	Downstream []graphNode
 }
 
-type taskDetailRow struct {
-	ID                 uuid.UUID  `gorm:"column:id"`
-	Code               string     `gorm:"column:code"`
-	Name               string     `gorm:"column:name"`
-	Start              time.Time  `gorm:"column:planned_start"`
-	End                time.Time  `gorm:"column:planned_end"`
-	Status             string     `gorm:"column:status"`
-	StartedAt          *time.Time `gorm:"column:started_at"`
-	DoneAt             *time.Time `gorm:"column:done_at"`
-	Dependents         int        `gorm:"column:dependents"`
-	OpenAncestors      int        `gorm:"column:open_ancestors"`
-	StartedDescendants int        `gorm:"column:started_descendants"`
-}
-
 // loadTaskDetail returns the task plus every task it waits on and every task
 // that waits on it, with the shortest number of steps in between.
 func (s *Server) loadTaskDetail(ctx context.Context, a *projectAccess, code string) (taskDTO, taskDetail, error) {
-	var row taskDetailRow
-	err := s.db.WithContext(ctx).Raw(`
-		SELECT t.id, t.code, t.name, t.planned_start, t.planned_end, t.status,
-		       t.started_at, t.done_at,
-		       (SELECT count(*) FROM task_deps d WHERE d.depends_on_id = t.id) AS dependents,
-		       (SELECT count(*) FROM task_closure c
-		          JOIN tasks anc ON anc.id = c.ancestor_id AND anc.status <> 'done'
-		          WHERE c.descendant_id = t.id) AS open_ancestors,
-		       (SELECT count(*) FROM task_closure c
-		          JOIN tasks des ON des.id = c.descendant_id AND des.status <> 'not_started'
-		          WHERE c.ancestor_id = t.id) AS started_descendants
-		FROM tasks t
-		WHERE t.project_id = ? AND t.code = ?`, a.ID, code).Scan(&row).Error
+	db := s.db.WithContext(ctx)
+
+	var task database.Task
+	err := db.Where("project_id = ? AND code = ?", a.ID, code).Take(&task).Error
+	if isNotFound(err) {
+		return taskDTO{}, taskDetail{}, httpx.NotFound("task not found")
+	}
 	if err != nil {
 		return taskDTO{}, taskDetail{}, err
 	}
-	if row.ID == uuid.Nil {
-		return taskDTO{}, taskDetail{}, httpx.NotFound("task not found")
+
+	// The three counters that decide the allowed actions. Each is one indexed
+	// aggregate; keeping them separate is what lets them stay GORM queries instead
+	// of subqueries embedded in a string.
+	var dependents, openAncestors, startedDescendants int64
+	if err := db.Model(&database.TaskDep{}).
+		Where("depends_on_id = ?", task.ID).Count(&dependents).Error; err != nil {
+		return taskDTO{}, taskDetail{}, err
+	}
+	if err := db.Model(&database.TaskClosure{}).
+		Joins("JOIN tasks AS ancestor ON ancestor.id = task_closure.ancestor_id AND ancestor.status <> ?", statusDone).
+		Where("task_closure.descendant_id = ?", task.ID).
+		Count(&openAncestors).Error; err != nil {
+		return taskDTO{}, taskDetail{}, err
+	}
+	if err := db.Model(&database.TaskClosure{}).
+		Joins("JOIN tasks AS descendant ON descendant.id = task_closure.descendant_id AND descendant.status <> ?", statusNotStarted).
+		Where("task_closure.ancestor_id = ?", task.ID).
+		Count(&startedDescendants).Error; err != nil {
+		return taskDTO{}, taskDetail{}, err
 	}
 
 	deps := []string{}
-	if err := s.db.WithContext(ctx).Table("task_deps AS d").
+	if err := db.Table("task_deps AS d").
 		Select("t.code").
 		Joins("JOIN tasks t ON t.id = d.depends_on_id").
-		Where("d.task_id = ?", row.ID).
+		Where("d.task_id = ?", task.ID).
 		Order("t.code").Scan(&deps).Error; err != nil {
 		return taskDTO{}, taskDetail{}, err
 	}
 
 	d := taskDTO{
-		ID: row.Code, ProjectID: a.Code, Name: row.Name,
-		PlannedStart: dateStr(row.Start), PlannedEnd: dateStr(row.End),
-		Status: row.Status, StartedAt: row.StartedAt, DoneAt: row.DoneAt,
-		DependsOn: deps, DependentCount: row.Dependents,
-		IsLate:    isLate(row.Status, row.Start, row.End, time.Now()),
-		IsBlocked: row.Status != statusDone && row.OpenAncestors > 0,
+		ID: task.Code, ProjectID: a.Code, Name: task.Name,
+		PlannedStart: dateStr(task.PlannedStart), PlannedEnd: dateStr(task.PlannedEnd),
+		Status: task.Status, StartedAt: task.StartedAt, DoneAt: task.DoneAt,
+		DependsOn: deps, DependentCount: int(dependents),
+		IsLate:    isLate(task.Status, task.PlannedStart, task.PlannedEnd, time.Now()),
+		IsBlocked: task.Status != statusDone && openAncestors > 0,
 	}
-	d.AllowedActions = allowedActions(row.Status, row.OpenAncestors, row.StartedDescendants)
+	d.AllowedActions = allowedActions(task.Status, int(openAncestors), int(startedDescendants))
 
 	detail := taskDetail{}
-	if detail.Upstream, err = s.loadGraph(ctx, row.ID, true); err != nil {
+	if detail.Upstream, err = s.loadGraph(ctx, task.ID, true); err != nil {
 		return d, detail, err
 	}
-	if detail.Downstream, err = s.loadGraph(ctx, row.ID, false); err != nil {
+	if detail.Downstream, err = s.loadGraph(ctx, task.ID, false); err != nil {
 		return d, detail, err
 	}
 	return d, detail, nil
 }
 
 func (s *Server) loadGraph(ctx context.Context, taskID uuid.UUID, upstream bool) ([]graphNode, error) {
-	query := `
-		SELECT t.code AS id, t.name, t.status, t.planned_start, t.planned_end, c.depth AS steps
-		FROM task_closure c
-		JOIN tasks t ON t.id = c.ancestor_id
-		WHERE c.descendant_id = ?
-		ORDER BY c.depth, t.code`
+	const projection = `tasks.code AS id, tasks.name, tasks.status, tasks.planned_start,
+		tasks.planned_end, task_closure.depth AS steps`
+
+	db := s.db.WithContext(ctx)
+	query := db.Model(&database.Task{}).
+		Select(projection).
+		Joins("JOIN task_closure ON task_closure.ancestor_id = tasks.id").
+		Where("task_closure.descendant_id = ?", taskID)
 	if !upstream {
-		query = `
-		SELECT t.code AS id, t.name, t.status, t.planned_start, t.planned_end, c.depth AS steps
-		FROM task_closure c
-		JOIN tasks t ON t.id = c.descendant_id
-		WHERE c.ancestor_id = ?
-		ORDER BY c.depth, t.code`
+		query = db.Model(&database.Task{}).
+			Select(projection).
+			Joins("JOIN task_closure ON task_closure.descendant_id = tasks.id").
+			Where("task_closure.ancestor_id = ?", taskID)
 	}
 
 	var rows []struct {
@@ -421,7 +442,8 @@ func (s *Server) loadGraph(ctx context.Context, taskID uuid.UUID, upstream bool)
 		End    time.Time `gorm:"column:planned_end"`
 		Steps  int       `gorm:"column:steps"`
 	}
-	if err := s.db.WithContext(ctx).Raw(query, taskID).Scan(&rows).Error; err != nil {
+	if err := query.Clauses(ordering("task_closure.depth, tasks.code", "ASC")).
+		Scan(&rows).Error; err != nil {
 		return nil, err
 	}
 
@@ -589,10 +611,10 @@ func (s *Server) transition(w http.ResponseWriter, r *http.Request, action strin
 				return httpx.Unprocessable("only a task that has not started can be started")
 			}
 			var openAncestors int64
-			if err := tx.Raw(`
-				SELECT count(*) FROM task_closure c
-				JOIN tasks a ON a.id = c.ancestor_id AND a.status <> 'done'
-				WHERE c.descendant_id = ?`, task.ID).Row().Scan(&openAncestors); err != nil {
+			if err := tx.Model(&database.TaskClosure{}).
+				Joins("JOIN tasks AS ancestor ON ancestor.id = task_closure.ancestor_id AND ancestor.status <> ?", statusDone).
+				Where("task_closure.descendant_id = ?", task.ID).
+				Count(&openAncestors).Error; err != nil {
 				return err
 			}
 			if openAncestors > 0 {
@@ -613,10 +635,10 @@ func (s *Server) transition(w http.ResponseWriter, r *http.Request, action strin
 				return httpx.Unprocessable("only a done task can be reopened")
 			}
 			var startedDescendants int64
-			if err := tx.Raw(`
-				SELECT count(*) FROM task_closure c
-				JOIN tasks d ON d.id = c.descendant_id AND d.status <> 'not_started'
-				WHERE c.ancestor_id = ?`, task.ID).Row().Scan(&startedDescendants); err != nil {
+			if err := tx.Model(&database.TaskClosure{}).
+				Joins("JOIN tasks AS descendant ON descendant.id = task_closure.descendant_id AND descendant.status <> ?", statusNotStarted).
+				Where("task_closure.ancestor_id = ?", task.ID).
+				Count(&startedDescendants).Error; err != nil {
 				return err
 			}
 			if startedDescendants > 0 {
@@ -710,12 +732,13 @@ func (s *Server) handleAddDependency(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Cycle: does the prerequisite already wait on this task?
-		var wouldCycle bool
-		if err := tx.Raw(`SELECT EXISTS (SELECT 1 FROM task_closure WHERE ancestor_id = ? AND descendant_id = ?)`,
-			taskID, dependsOnID).Row().Scan(&wouldCycle); err != nil {
+		var cyclePath int64
+		if err := tx.Model(&database.TaskClosure{}).
+			Where("ancestor_id = ? AND descendant_id = ?", taskID, dependsOnID).
+			Count(&cyclePath).Error; err != nil {
 			return err
 		}
-		if wouldCycle {
+		if cyclePath > 0 {
 			return httpx.Unprocessable(
 				"%s already waits on %s, so this dependency would create a cycle", dependsOnCode, code)
 		}
@@ -765,11 +788,26 @@ func (s *Server) handleRemoveDependency(w http.ResponseWriter, r *http.Request) 
 		if err := lockProject(tx, a.ID); err != nil {
 			return err
 		}
-		result := tx.Exec(`
-			DELETE FROM task_deps d
-			USING tasks t, tasks dep
-			WHERE d.task_id = t.id AND d.depends_on_id = dep.id
-			  AND d.project_id = ? AND t.code = ? AND dep.code = ?`, a.ID, code, depCode)
+		var tasks []database.Task
+		if err := tx.Where("project_id = ? AND code IN ?", a.ID, []string{code, depCode}).
+			Find(&tasks).Error; err != nil {
+			return err
+		}
+		var taskID, dependsOnID uuid.UUID
+		for _, t := range tasks {
+			switch t.Code {
+			case code:
+				taskID = t.ID
+			case depCode:
+				dependsOnID = t.ID
+			}
+		}
+		if taskID == uuid.Nil || dependsOnID == uuid.Nil {
+			return httpx.NotFound("no such dependency")
+		}
+
+		result := tx.Where("project_id = ? AND task_id = ? AND depends_on_id = ?",
+			a.ID, taskID, dependsOnID).Delete(&database.TaskDep{})
 		if result.Error != nil {
 			return result.Error
 		}
@@ -796,9 +834,14 @@ func (s *Server) handleGetTaskGraph(w http.ResponseWriter, r *http.Request) {
 // recomputed rather than removed. Level by level (instead of one recursive CTE)
 // keeps the work polynomial even on a densely connected project.
 func rebuildClosure(tx *gorm.DB, projectID uuid.UUID) error {
-	if err := tx.Exec(`DELETE FROM task_closure WHERE project_id = ?`, projectID).Error; err != nil {
+	if err := tx.Where("project_id = ?", projectID).Delete(&database.TaskClosure{}).Error; err != nil {
 		return err
 	}
+
+	// The two statements below are the only ones left as text. GORM has no
+	// builder for INSERT ... SELECT, and the alternative - one Create per pair -
+	// turns a set operation into tens of thousands of round trips on a project
+	// with 3,000 tasks. The surrounding delete above is a normal GORM Delete.
 	result := tx.Exec(`
 		INSERT INTO task_closure (project_id, ancestor_id, descendant_id, depth)
 		SELECT ?, depends_on_id, task_id, 1 FROM task_deps WHERE project_id = ?

@@ -52,6 +52,13 @@ type Project struct {
 
 func (Project) TableName() string { return "projects" }
 
+const (
+	// StoreKindCompany is the single central warehouse every project draws from.
+	StoreKindCompany = "company"
+	// StoreKindProject is one warehouse per project.
+	StoreKindProject = "project"
+)
+
 type Store struct {
 	ID        uuid.UUID  `gorm:"type:uuid;primaryKey"`
 	Kind      string     `gorm:"not null"`

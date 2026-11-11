@@ -274,18 +274,14 @@ func (s *Server) requireCompanyStore(w http.ResponseWriter, r *http.Request) (*P
 		httpx.Fail(w, r, httpx.Forbidden("only a company store manager can reach the company store"))
 		return nil, uuid.Nil, false
 	}
-	var storeIDStr string
-	if err := s.db.WithContext(r.Context()).Table("stores").
-		Select("id").Where("kind = 'company'").Row().Scan(&storeIDStr); err != nil {
+	var company database.Store
+	if err := s.db.WithContext(r.Context()).
+		Select("id").Where("kind = ?", database.StoreKindCompany).
+		Take(&company).Error; err != nil {
 		httpx.Fail(w, r, httpx.Internal(errors.New("company store is missing")))
 		return nil, uuid.Nil, false
 	}
-	storeID, err := uuid.Parse(storeIDStr)
-	if err != nil {
-		httpx.Fail(w, r, httpx.Internal(errors.New("company store is missing")))
-		return nil, uuid.Nil, false
-	}
-	return p, storeID, true
+	return p, company.ID, true
 }
 
 // statusExpr mirrors the three states the brief defines. It is repeated in the

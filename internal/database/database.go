@@ -4,6 +4,10 @@
 // order inside a transaction. A tiny schema_migrations table records what has
 // run, so a restart is a no-op. This keeps `docker compose up` to a single step:
 // no separate migrate container, no CLI to install.
+//
+// Everything this package does at runtime goes through GORM. The two exceptions
+// are deliberate and marked where they occur: the body of a migration file is
+// arbitrary DDL by definition, so it can only be handed to the driver as text.
 package database
 
 import (
@@ -16,13 +20,25 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
 
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
+
+// schemaMigration is the runner's own bookkeeping. It is a GORM model like any
+// other, so creating it, reading it and recording a version are ordinary
+// Create/Count calls rather than hand-written SQL.
+type schemaMigration struct {
+	Version   string    `gorm:"column:version;primaryKey"`
+	AppliedAt time.Time `gorm:"column:applied_at;not null;autoCreateTime"`
+}
+
+func (schemaMigration) TableName() string { return "schema_migrations" }
 
 // Connect opens the GORM handle and waits for Postgres to accept connections,
 // because the API container may start before the database is ready.
@@ -61,13 +77,11 @@ func Connect(ctx context.Context, url string) (*gorm.DB, error) {
 	return nil, fmt.Errorf("database unreachable: %w", lastErr)
 }
 
+// Migrate applies every embedded migration that has not run yet, in filename
+// order, each inside its own transaction together with the row that records it.
 func Migrate(ctx context.Context, db *gorm.DB) error {
-	if err := db.WithContext(ctx).Exec(`
-		CREATE TABLE IF NOT EXISTS schema_migrations (
-			version    text PRIMARY KEY,
-			applied_at timestamptz NOT NULL DEFAULT now()
-		)`).Error; err != nil {
-		return err
+	if err := db.WithContext(ctx).AutoMigrate(&schemaMigration{}); err != nil {
+		return fmt.Errorf("prepare schema_migrations: %w", err)
 	}
 
 	entries, err := fs.Glob(migrationFiles, "migrations/*.sql")
@@ -80,8 +94,8 @@ func Migrate(ctx context.Context, db *gorm.DB) error {
 		version := strings.TrimSuffix(strings.TrimPrefix(name, "migrations/"), ".sql")
 
 		var applied int64
-		if err := db.WithContext(ctx).Raw(
-			`SELECT count(*) FROM schema_migrations WHERE version = ?`, version).Scan(&applied).Error; err != nil {
+		if err := db.WithContext(ctx).Model(&schemaMigration{}).
+			Where("version = ?", version).Count(&applied).Error; err != nil {
 			return err
 		}
 		if applied > 0 {
@@ -94,10 +108,13 @@ func Migrate(ctx context.Context, db *gorm.DB) error {
 		}
 
 		err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			// A migration file is raw DDL - partial indexes, CHECK constraints,
+			// triggers and sequence defaults that no model tag can express - so it
+			// goes to the driver as text. Everything around it is GORM.
 			if err := tx.Exec(string(body)).Error; err != nil {
 				return fmt.Errorf("migration %s: %w", version, err)
 			}
-			return tx.Exec(`INSERT INTO schema_migrations (version) VALUES (?)`, version).Error
+			return tx.Create(&schemaMigration{Version: version}).Error
 		})
 		if err != nil {
 			return err
@@ -108,8 +125,14 @@ func Migrate(ctx context.Context, db *gorm.DB) error {
 }
 
 // EnsureCompanyStore creates the single central warehouse if it is missing.
+// The stores_single_company partial unique index makes this a no-op on every
+// start after the first.
 func EnsureCompanyStore(ctx context.Context, db *gorm.DB) error {
-	return db.WithContext(ctx).Exec(`
-		INSERT INTO stores (id, kind) VALUES (gen_random_uuid(), 'company')
-		ON CONFLICT DO NOTHING`).Error
+	return db.WithContext(ctx).
+		Clauses(clause.OnConflict{DoNothing: true}).
+		Create(&Store{
+			ID:        uuid.New(),
+			Kind:      StoreKindCompany,
+			CreatedAt: time.Now().UTC(),
+		}).Error
 }

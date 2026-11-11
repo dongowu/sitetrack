@@ -223,12 +223,12 @@ func (s *Server) loadOpenInvitation(ctx context.Context, invitationID uuid.UUID,
 		return inv, "", err
 	}
 
-	var code string
-	if err := s.db.WithContext(ctx).Table("projects").
-		Select("code").Where("id = ?", inv.ProjectID).Row().Scan(&code); err != nil {
+	var project database.Project
+	if err := s.db.WithContext(ctx).Select("code").
+		Where("id = ?", inv.ProjectID).Take(&project).Error; err != nil {
 		return inv, "", err
 	}
-	return inv, code, nil
+	return inv, project.Code, nil
 }
 
 func (s *Server) handleAcceptInvitation(w http.ResponseWriter, r *http.Request) {
