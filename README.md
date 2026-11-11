@@ -44,8 +44,15 @@ minutes on a laptop and leaves 500k tasks, 1M dependencies, 400k deliveries and
 
 ---
 
-Dependencies are vendored (`vendor/`), so the image build needs no module proxy
-and cannot drift between machines.
+Dependencies are resolved from `go.mod` during the image build, so nothing
+third-party is committed. `go.mod` and `go.sum` are copied into their own layer
+and `go mod download` runs before the source is copied, so editing a handler
+does not re-download the module graph. If the default proxy is slow from where
+you build, pass a mirror:
+
+```bash
+docker compose build --build-arg GOPROXY=https://goproxy.cn,direct api
+```
 
 ## Repository layout
 

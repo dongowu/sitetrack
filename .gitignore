@@ -3,3 +3,6 @@
 /sitetrack
 *.test
 .DS_Store
+
+# Dependencies are resolved from go.mod at build time, not committed.
+vendor/

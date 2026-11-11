@@ -4,3 +4,4 @@ scripts
 .env
 .env.*
 sitetrack
+vendor
