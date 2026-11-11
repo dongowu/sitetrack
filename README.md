@@ -3,7 +3,7 @@
 Backend for SiteTrack, a construction project and materials tracker: the work
 planned on each site, and the materials stored at and moved between sites.
 
-Go 1.26 · PostgreSQL 16 · GORM · `docker compose up` and nothing else.
+Go 1.26 · Gin · PostgreSQL 16 · GORM · `docker compose up` and nothing else.
 
 ---
 
@@ -39,8 +39,8 @@ curl -s localhost:8080/api/v1/projects -H "Authorization: Bearer $TOKEN" | jq '.
 
 The seeder is incremental: `--scale 0.01` loads a 1/100th slice in about a
 second, which is what I used while developing. A full run takes roughly six
-minutes on a laptop and leaves 500k tasks, 1M dependencies, 400k deliveries and
-3M delivery lines in place.
+minutes on a laptop and leaves 500k tasks, 1.06M dependencies, 400k deliveries
+and 3.2M delivery lines in place.
 
 ---
 
@@ -157,6 +157,15 @@ transitive closure.
 
 ## Decisions worth explaining
 
+**Routing and middleware are Gin's.** Handlers are `func(c *gin.Context)`, path
+parameters come from `c.Param`, and the JSON envelope is written by one helper so
+no handler touches a status code or a header. Two of Gin's defaults are switched
+off deliberately: `gin.New()` instead of `gin.Default()` because its access log
+would duplicate the structured one, and a custom recovery because the stock one
+writes a plain-text 500 body the frontend cannot parse. `binding.JSON` is used
+explicitly with `DisallowUnknownFields` rather than `ShouldBindJSON`, so a body
+sent with the wrong `Content-Type` fails loudly instead of binding nothing.
+
 **Every runtime query goes through GORM.** Models, CRUD, transactions, upserts
 (`clause.OnConflict`), row locks (`clause.Locking`), `RETURNING`
 (`clause.Returning`), subqueries and the analytic reads are all builder calls.
@@ -224,8 +233,15 @@ float drift can accumulate; the API reads them as float8 for JSON.
 ## Scale
 
 Seeded volume: 5,000 users · 2,000 projects · 50,000 invitations · 500,000 tasks
-· 1,000,000 dependencies · 20,000 materials · 400,000 deliveries · 3,000,000
-delivery lines · 2 closure rows per dependency on average.
+· 1,058,236 dependencies · 20,000 materials · 400,000 deliveries · 3,197,185
+delivery lines · 1.74M closure rows.
+
+The row counts are exact where the brief gives a number and slightly above it
+where the number is derived. Dependencies and delivery lines are generated from
+per-item distributions (2.125 edges per task, 8 materials per delivery), so
+aiming at the floor of 1M and 3M would land under it on half the runs; 1.06M and
+3.2M always clear it. Everything the brief measures by count — users, projects,
+invitations, tasks, materials, deliveries — is hit exactly.
 
 What makes the screens hold up:
 
@@ -252,21 +268,21 @@ API and Postgres in Docker on the same host:
 
 | endpoint | median | rows / total |
 | --- | --- | --- |
-| `GET /projects` | 87 ms | 20 / 2003 |
-| `GET /projects?sort=late_tasks&dir=desc` | 92 ms | 20 / 2003 |
-| `GET /projects?offset=1000` | 65 ms | 20 / 2003 |
-| `GET /projects/PRJ-0002` | 19 ms | 1 |
-| `GET /projects/PRJ-0002/tasks` (3,000-task project) | 5 ms | 20 / 3000 |
-| `…/tasks?blocked=true` | 14 ms | 20 / 2136 |
+| `GET /projects` | 84 ms | 20 / 2001 |
+| `GET /projects?sort=late_tasks&dir=desc` | 89 ms | 20 / 2001 |
+| `GET /projects?offset=1000` | 62 ms | 20 / 2001 |
+| `GET /projects/PRJ-0002` | 18 ms | 1 |
+| `GET /projects/PRJ-0002/tasks` (3,000-task project) | 3 ms | 20 / 3000 |
+| `…/tasks?blocked=true` | 17 ms | 20 / 2117 |
 | `GET /projects/PRJ-0002/tasks/PRJ-0002-T-3000` | 4 ms | 1 |
-| `GET /projects/PRJ-0002/store` | 8 ms | 20 / 321 |
-| `GET /projects/PRJ-0002/deliveries` | 8 ms | 20 / 205 |
-| `GET /company/store` | 15 ms | 20 / 20003 |
-| `GET /company/store?status=low_stock` | 15 ms | 20 / 1160 |
-| `GET /company/deliveries` | 58 ms | 20 / 400000 |
-| `GET /materials` | 2 ms | 20 / 20003 |
+| `GET /projects/PRJ-0002/store` | 5 ms | 20 / 226 |
+| `GET /projects/PRJ-0002/deliveries` | 5 ms | 20 / 195 |
+| `GET /company/store` | 19 ms | 20 / 20001 |
+| `GET /company/store?status=low_stock` | 16 ms | 20 / 1149 |
+| `GET /company/deliveries` | 59 ms | 20 / 400000 |
+| `GET /materials` | 2 ms | 20 / 20001 |
 | `GET /me` | 4 ms | 1 |
-| `GET /notifications` | 4 ms | 13 / 13 |
+| `GET /notifications` | 3 ms | 13 / 13 |
 
 The project list is the slowest read at ~90 ms, and that is honest about what it
 does: to show a percentage-done and a late count for every project it has to
