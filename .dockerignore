@@ -5,3 +5,5 @@ scripts
 .env.*
 sitetrack
 vendor
+.workbuddy
+.DS_Store

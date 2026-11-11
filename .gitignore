@@ -6,3 +6,6 @@
 
 # Dependencies are resolved from go.mod at build time, not committed.
 vendor/
+
+# Editor and agent scratch space: local notes, session state, logs.
+.workbuddy/
