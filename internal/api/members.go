@@ -3,12 +3,12 @@ package api
 import (
 	"context"
 	"errors"
-	"net/http"
 	"strings"
 	"time"
 
 	"github.com/dongowu/sitetrack/internal/database"
 	"github.com/dongowu/sitetrack/internal/httpx"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -35,16 +35,16 @@ type invitationDTO struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
-func (s *Server) handleListMembers(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), false)
+func (s *Server) handleListMembers(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), false)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
 
 	var rows []memberDTO
-	err = s.db.WithContext(r.Context()).
+	err = s.db.WithContext(c.Request.Context()).
 		Table("project_members AS m").
 		Select("u.id AS user_id, u.name, u.email, u.app_role, m.is_admin AS is_project_admin, m.joined_at").
 		Joins("JOIN users u ON u.id = m.user_id").
@@ -52,20 +52,20 @@ func (s *Server) handleListMembers(w http.ResponseWriter, r *http.Request) {
 		Order("m.is_admin DESC, lower(u.name) ASC").
 		Scan(&rows).Error
 	if err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 	if rows == nil {
 		rows = []memberDTO{}
 	}
 
-	pending, err := s.pendingInvitationsForProject(r.Context(), a.ID)
+	pending, err := s.pendingInvitationsForProject(c.Request.Context(), a.ID)
 	if err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
-	httpx.OK(w, map[string]any{
+	httpx.OK(c, map[string]any{
 		"project_id":          a.Code,
 		"is_project_admin":    a.IsAdmin,
 		"members":             rows,
@@ -107,20 +107,20 @@ type inviteRequest struct {
 	UserID string `json:"user_id"`
 }
 
-func (s *Server) handleInvite(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), true)
+func (s *Server) handleInvite(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), true)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
 	var req inviteRequest
-	if err := decodeJSON(r, &req); err != nil {
-		httpx.Fail(w, r, err)
+	if err := decodeJSON(c, &req); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
 	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
-	ctx := r.Context()
+	ctx := c.Request.Context()
 
 	var invitee database.User
 	query := s.db.WithContext(ctx).Where("deleted_at IS NULL")
@@ -128,33 +128,33 @@ func (s *Server) handleInvite(w http.ResponseWriter, r *http.Request) {
 	case req.UserID != "":
 		id, err := parseUUID(req.UserID)
 		if err != nil {
-			httpx.Fail(w, r, err)
+			httpx.Fail(c, err)
 			return
 		}
 		query = query.Where("id = ?", id)
 	case req.Email != "":
 		query = query.Where("lower(email) = ?", req.Email)
 	default:
-		httpx.Fail(w, r, httpx.BadRequest("email or user_id is required"))
+		httpx.Fail(c, httpx.BadRequest("email or user_id is required"))
 		return
 	}
 	if err := query.Take(&invitee).Error; err != nil {
 		if isNotFound(err) {
-			httpx.Fail(w, r, httpx.NotFound("no registered user with that email"))
+			httpx.Fail(c, httpx.NotFound("no registered user with that email"))
 			return
 		}
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
 	var isMember int64
 	if err := s.db.WithContext(ctx).Model(&database.ProjectMember{}).
 		Where("project_id = ? AND user_id = ?", a.ID, invitee.ID).Count(&isMember).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 	if isMember > 0 {
-		httpx.Fail(w, r, httpx.Conflict("that person is already a member of this project"))
+		httpx.Fail(c, httpx.Conflict("that person is already a member of this project"))
 		return
 	}
 
@@ -168,45 +168,45 @@ func (s *Server) handleInvite(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.db.WithContext(ctx).Create(&inv).Error; err != nil {
 		if errors.Is(err, gorm.ErrDuplicatedKey) {
-			httpx.Fail(w, r, httpx.Conflict("that person already has an open invitation to this project"))
+			httpx.Fail(c, httpx.Conflict("that person already has an open invitation to this project"))
 			return
 		}
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
-	httpx.Created(w, invitationDTO{
+	httpx.Created(c, invitationDTO{
 		ID: inv.ID.String(), ProjectID: a.Code, ProjectName: a.Name, InviterName: p.Name,
 		InviteeID: invitee.ID.String(), InviteeName: invitee.Name, InviteeEmail: invitee.Email,
 		Status: "pending", CreatedAt: inv.CreatedAt,
 	})
 }
 
-func (s *Server) handleWithdrawInvitation(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), true)
+func (s *Server) handleWithdrawInvitation(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), true)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	invitationID, err := parseUUID(r.PathValue("invitationID"))
+	invitationID, err := parseUUID(c.Param("invitationID"))
 	if err != nil {
-		httpx.Fail(w, r, httpx.NotFound("no open invitation with that id"))
+		httpx.Fail(c, httpx.NotFound("no open invitation with that id"))
 		return
 	}
 
-	result := s.db.WithContext(r.Context()).Model(&database.Invitation{}).
+	result := s.db.WithContext(c.Request.Context()).Model(&database.Invitation{}).
 		Where("id = ? AND project_id = ? AND status = 'pending'", invitationID, a.ID).
 		Updates(map[string]any{"status": "withdrawn", "responded_at": time.Now().UTC()})
 	if result.Error != nil {
-		httpx.Fail(w, r, httpx.Internal(result.Error))
+		httpx.Fail(c, httpx.Internal(result.Error))
 		return
 	}
 	if result.RowsAffected == 0 {
-		httpx.Fail(w, r, httpx.NotFound("no open invitation with that id"))
+		httpx.Fail(c, httpx.NotFound("no open invitation with that id"))
 		return
 	}
-	httpx.NoContent(w)
+	httpx.NoContent(c)
 }
 
 // loadOpenInvitation finds a pending invitation that belongs to the caller. The
@@ -231,20 +231,20 @@ func (s *Server) loadOpenInvitation(ctx context.Context, invitationID uuid.UUID,
 	return inv, project.Code, nil
 }
 
-func (s *Server) handleAcceptInvitation(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	invitationID, err := parseUUID(r.PathValue("invitationID"))
+func (s *Server) handleAcceptInvitation(c *gin.Context) {
+	p := caller(c)
+	invitationID, err := parseUUID(c.Param("invitationID"))
 	if err != nil {
-		httpx.Fail(w, r, httpx.NotFound("invitation not found"))
+		httpx.Fail(c, httpx.NotFound("invitation not found"))
 		return
 	}
-	inv, projectCode, err := s.loadOpenInvitation(r.Context(), invitationID, p.UserID)
+	inv, projectCode, err := s.loadOpenInvitation(c.Request.Context(), invitationID, p.UserID)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
 
-	err = s.db.WithContext(r.Context()).Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
 		now := time.Now().UTC()
 		result := tx.Model(&database.Invitation{}).
 			Where("id = ? AND invitee_id = ? AND status = 'pending'", inv.ID, p.UserID).
@@ -261,39 +261,39 @@ func (s *Server) handleAcceptInvitation(w http.ResponseWriter, r *http.Request) 
 			}).Error
 	})
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
 
-	httpx.OK(w, map[string]any{"project_id": projectCode, "status": "accepted"})
+	httpx.OK(c, map[string]any{"project_id": projectCode, "status": "accepted"})
 }
 
-func (s *Server) handleRejectInvitation(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	invitationID, err := parseUUID(r.PathValue("invitationID"))
+func (s *Server) handleRejectInvitation(c *gin.Context) {
+	p := caller(c)
+	invitationID, err := parseUUID(c.Param("invitationID"))
 	if err != nil {
-		httpx.Fail(w, r, httpx.NotFound("invitation not found"))
+		httpx.Fail(c, httpx.NotFound("invitation not found"))
 		return
 	}
-	inv, projectCode, err := s.loadOpenInvitation(r.Context(), invitationID, p.UserID)
+	inv, projectCode, err := s.loadOpenInvitation(c.Request.Context(), invitationID, p.UserID)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
 
 	now := time.Now().UTC()
-	result := s.db.WithContext(r.Context()).Model(&database.Invitation{}).
+	result := s.db.WithContext(c.Request.Context()).Model(&database.Invitation{}).
 		Where("id = ? AND invitee_id = ? AND status = 'pending'", inv.ID, p.UserID).
 		Updates(map[string]any{"status": "rejected", "responded_at": now, "read_at": now})
 	if result.Error != nil {
-		httpx.Fail(w, r, httpx.Internal(result.Error))
+		httpx.Fail(c, httpx.Internal(result.Error))
 		return
 	}
 	if result.RowsAffected == 0 {
-		httpx.Fail(w, r, httpx.Conflict("invitation was already answered or withdrawn"))
+		httpx.Fail(c, httpx.Conflict("invitation was already answered or withdrawn"))
 		return
 	}
-	httpx.OK(w, map[string]any{"project_id": projectCode, "status": "rejected"})
+	httpx.OK(c, map[string]any{"project_id": projectCode, "status": "rejected"})
 }
 
 type updateMemberRequest struct {
@@ -307,29 +307,29 @@ func lockProject(tx *gorm.DB, projectID uuid.UUID) error {
 	return tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", projectID).Take(&p).Error
 }
 
-func (s *Server) handleUpdateMember(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), true)
+func (s *Server) handleUpdateMember(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), true)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
 	var req updateMemberRequest
-	if err := decodeJSON(r, &req); err != nil {
-		httpx.Fail(w, r, err)
+	if err := decodeJSON(c, &req); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
 	if req.IsProjectAdmin == nil {
-		httpx.Fail(w, r, httpx.BadRequest("is_project_admin is required"))
+		httpx.Fail(c, httpx.BadRequest("is_project_admin is required"))
 		return
 	}
-	targetID, err := parseUUID(r.PathValue("userID"))
+	targetID, err := parseUUID(c.Param("userID"))
 	if err != nil {
-		httpx.Fail(w, r, httpx.NotFound("that person is not a member of this project"))
+		httpx.Fail(c, httpx.NotFound("that person is not a member of this project"))
 		return
 	}
 
-	err = s.db.WithContext(r.Context()).Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
 		if err := lockProject(tx, a.ID); err != nil {
 			return err
 		}
@@ -358,26 +358,26 @@ func (s *Server) handleUpdateMember(w http.ResponseWriter, r *http.Request) {
 			Update("is_admin", *req.IsProjectAdmin).Error
 	})
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	httpx.OK(w, map[string]any{"user_id": targetID.String(), "is_project_admin": *req.IsProjectAdmin})
+	httpx.OK(c, map[string]any{"user_id": targetID.String(), "is_project_admin": *req.IsProjectAdmin})
 }
 
-func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), true)
+func (s *Server) handleRemoveMember(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), true)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	targetID, err := parseUUID(r.PathValue("userID"))
+	targetID, err := parseUUID(c.Param("userID"))
 	if err != nil {
-		httpx.Fail(w, r, httpx.NotFound("that person is not a member of this project"))
+		httpx.Fail(c, httpx.NotFound("that person is not a member of this project"))
 		return
 	}
 
-	err = s.db.WithContext(r.Context()).Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
 		if err := lockProject(tx, a.ID); err != nil {
 			return err
 		}
@@ -405,10 +405,10 @@ func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 			Delete(&database.ProjectMember{}).Error
 	})
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	httpx.NoContent(w)
+	httpx.NoContent(c)
 }
 
 type notificationRow struct {
@@ -423,12 +423,12 @@ type notificationRow struct {
 
 // handleListNotifications powers screen 3: invitations for the caller, newest
 // first, with Accept and Reject available only while pending.
-func (s *Server) handleListNotifications(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	pg := s.paging(r)
-	ctx := r.Context()
+func (s *Server) handleListNotifications(c *gin.Context) {
+	p := caller(c)
+	pg := s.paging(c)
+	ctx := c.Request.Context()
 
-	status := queryParam(r, "status")
+	status := queryParam(c, "status")
 	query := s.db.WithContext(ctx).
 		Table("invitations AS i").
 		Select(`i.id, p.code AS project_code, p.name AS project_name, u.name AS inviter_name,
@@ -443,7 +443,7 @@ func (s *Server) handleListNotifications(w http.ResponseWriter, r *http.Request)
 	var rows []notificationRow
 	if err := query.Order("i.created_at DESC, i.id DESC").
 		Limit(pg.Limit).Offset(pg.Offset).Scan(&rows).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
@@ -465,11 +465,11 @@ func (s *Server) handleListNotifications(w http.ResponseWriter, r *http.Request)
 	var total int64
 	if err := s.db.WithContext(ctx).Model(&database.Invitation{}).
 		Where("invitee_id = ?", p.UserID).Count(&total).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
-	httpx.List(w, items, map[string]any{
+	httpx.List(c, items, map[string]any{
 		"total":                total,
 		"limit":                pg.Limit,
 		"offset":               pg.Offset,
@@ -477,23 +477,23 @@ func (s *Server) handleListNotifications(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-func (s *Server) handleMarkNotificationsRead(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	if err := s.db.WithContext(r.Context()).Model(&database.Invitation{}).
+func (s *Server) handleMarkNotificationsRead(c *gin.Context) {
+	p := caller(c)
+	if err := s.db.WithContext(c.Request.Context()).Model(&database.Invitation{}).
 		Where("invitee_id = ? AND read_at IS NULL", p.UserID).
 		Update("read_at", time.Now().UTC()).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
-	httpx.OK(w, map[string]any{"unread_notifications": 0})
+	httpx.OK(c, map[string]any{"unread_notifications": 0})
 }
 
 // handleSearchUsers lets a project admin find somebody to invite by name or
 // email. It only exposes id, name and email, and only to a valid caller.
-func (s *Server) handleSearchUsers(w http.ResponseWriter, r *http.Request) {
-	q := queryParam(r, "q")
+func (s *Server) handleSearchUsers(c *gin.Context) {
+	q := queryParam(c, "q")
 	if len(q) < 2 {
-		httpx.Fail(w, r, httpx.BadRequest("q must be at least 2 characters"))
+		httpx.Fail(c, httpx.BadRequest("q must be at least 2 characters"))
 		return
 	}
 	limit := 20
@@ -504,13 +504,13 @@ func (s *Server) handleSearchUsers(w http.ResponseWriter, r *http.Request) {
 		Email   string    `gorm:"column:email"`
 		AppRole string    `gorm:"column:app_role"`
 	}
-	err := s.db.WithContext(r.Context()).Model(&database.User{}).
+	err := s.db.WithContext(c.Request.Context()).Model(&database.User{}).
 		Select("id, name, email, app_role").
 		Where("deleted_at IS NULL").
 		Where("lower(name) LIKE ? OR lower(email) LIKE ?", likePattern(q), likePattern(q)).
 		Order("lower(name)").Limit(limit).Scan(&rows).Error
 	if err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
@@ -520,5 +520,5 @@ func (s *Server) handleSearchUsers(w http.ResponseWriter, r *http.Request) {
 			"id": row.ID.String(), "name": row.Name, "email": row.Email, "app_role": row.AppRole,
 		})
 	}
-	httpx.List(w, out, map[string]any{"limit": limit})
+	httpx.List(c, out, map[string]any{"limit": limit})
 }

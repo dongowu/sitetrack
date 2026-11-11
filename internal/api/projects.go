@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"strings"
 	"time"
 
 	"github.com/dongowu/sitetrack/internal/database"
 	"github.com/dongowu/sitetrack/internal/httpx"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -125,34 +125,34 @@ type createProjectRequest struct {
 	PlannedEnd   string `json:"planned_end"`
 }
 
-func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
+func (s *Server) handleCreateProject(c *gin.Context) {
+	p := caller(c)
 	var req createProjectRequest
-	if err := decodeJSON(r, &req); err != nil {
-		httpx.Fail(w, r, err)
+	if err := decodeJSON(c, &req); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	if req.Name == "" {
-		httpx.Fail(w, r, httpx.BadRequest("name is required"))
+		httpx.Fail(c, httpx.BadRequest("name is required"))
 		return
 	}
 	start, err := parseDate(req.PlannedStart)
 	if err != nil {
-		httpx.Fail(w, r, httpx.BadRequest("planned_start must be a date in YYYY-MM-DD form"))
+		httpx.Fail(c, httpx.BadRequest("planned_start must be a date in YYYY-MM-DD form"))
 		return
 	}
 	end, err := parseDate(req.PlannedEnd)
 	if err != nil {
-		httpx.Fail(w, r, httpx.BadRequest("planned_end must be a date in YYYY-MM-DD form"))
+		httpx.Fail(c, httpx.BadRequest("planned_end must be a date in YYYY-MM-DD form"))
 		return
 	}
 	if end.Before(start) {
-		httpx.Fail(w, r, httpx.BadRequest("planned_end cannot be before planned_start"))
+		httpx.Fail(c, httpx.BadRequest("planned_end cannot be before planned_start"))
 		return
 	}
 
-	ctx := r.Context()
+	ctx := c.Request.Context()
 	project := database.Project{
 		ID:           uuid.New(),
 		Name:         req.Name,
@@ -186,11 +186,11 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		}).Error
 	})
 	if err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
-	httpx.Created(w, projectDTO{
+	httpx.Created(c, projectDTO{
 		ID: project.Code, Name: project.Name,
 		PlannedStart: dateStr(project.PlannedStart), PlannedEnd: dateStr(project.PlannedEnd),
 		IsProjectAdmin: true, MemberCount: 1, CreatedAt: project.CreatedAt,
@@ -261,15 +261,15 @@ func (s *Server) taskRollup(db *gorm.DB, p *Principal) *gorm.DB {
 // handleListProjects answers with one statement: the page, the per project task
 // roll up, the member count and the total row count come back together, because
 // the alternative is one query per project on the screen.
-func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	pg := s.paging(r)
+func (s *Server) handleListProjects(c *gin.Context) {
+	p := caller(c)
+	pg := s.paging(c)
 
 	search := ""
-	if q := queryParam(r, "q"); q != "" {
+	if q := queryParam(c, "q"); q != "" {
 		search = likePattern(q)
 	}
-	hasLate := boolParam(r, "has_late_tasks") || boolParam(r, "has_late")
+	hasLate := boolParam(c, "has_late_tasks") || boolParam(c, "has_late")
 
 	orderBy := map[string]string{
 		"id":           "v.code",
@@ -279,12 +279,12 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 		"late_tasks":   "COALESCE(ts.late, 0)",
 		"created_at":   "v.created_at",
 	}
-	expr, ok := orderBy[queryParam(r, "sort")]
+	expr, ok := orderBy[queryParam(c, "sort")]
 	if !ok {
 		expr = orderBy["created_at"]
 	}
 
-	ctx := r.Context()
+	ctx := c.Request.Context()
 	db := s.db.WithContext(ctx)
 
 	query := db.
@@ -317,12 +317,12 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 	var rows []projectListRow
 	if err := query.
 		Clauses(clause.OrderBy{Expression: clause.Expr{
-			SQL:                expr + " " + direction(queryParam(r, "dir")) + ", v.code ASC",
+			SQL:                expr + " " + direction(queryParam(c, "dir")) + ", v.code ASC",
 			WithoutParentheses: true,
 		}}).
 		Limit(pg.Limit).Offset(pg.Offset).
 		Scan(&rows).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
@@ -346,7 +346,7 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 	if len(ids) > 0 {
 		blocked, err := s.blockedTaskCounts(ctx, ids)
 		if err != nil {
-			httpx.Fail(w, r, httpx.Internal(err))
+			httpx.Fail(c, httpx.Internal(err))
 			return
 		}
 		for i := range items {
@@ -358,7 +358,7 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 	if len(rows) > 0 {
 		total = rows[0].TotalRows
 	}
-	httpx.List(w, items, map[string]any{
+	httpx.List(c, items, map[string]any{
 		"total":                total,
 		"limit":                pg.Limit,
 		"offset":               pg.Offset,
@@ -412,14 +412,14 @@ type projectTaskRollup struct {
 	Late       int `gorm:"column:late"`
 }
 
-func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), false)
+func (s *Server) handleGetProject(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), false)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	ctx := r.Context()
+	ctx := c.Request.Context()
 	db := s.db.WithContext(ctx)
 
 	var row projectDetailRow
@@ -430,7 +430,7 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 		        projects.created_at`).
 		Where("projects.id = ?", a.ID).
 		Scan(&row).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
@@ -442,7 +442,7 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 		Select(taskRollupExpr).
 		Where("project_id = ?", a.ID).
 		Scan(&counts).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
@@ -450,17 +450,17 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 	if err := db.Model(&database.ProjectMember{}).
 		Where("project_id = ?", a.ID).
 		Count(&members).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
 	blocked, err := s.blockedTaskCounts(ctx, []uuid.UUID{a.ID})
 	if err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
-	httpx.OK(w, projectDTO{
+	httpx.OK(c, projectDTO{
 		ID: row.Code, Name: row.Name, PlannedStart: row.PlannedStart, PlannedEnd: row.PlannedEnd,
 		IsProjectAdmin: a.IsAdmin, MemberCount: int(members),
 		TaskCounts: taskCounts{Total: counts.Total, NotStarted: counts.NotStarted,
@@ -478,16 +478,16 @@ type updateProjectRequest struct {
 	PlannedEnd   *string `json:"planned_end"`
 }
 
-func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), true)
+func (s *Server) handleUpdateProject(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), true)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
 	var req updateProjectRequest
-	if err := decodeJSON(r, &req); err != nil {
-		httpx.Fail(w, r, err)
+	if err := decodeJSON(c, &req); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
 
@@ -495,7 +495,7 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 	if req.Name != nil {
 		name := strings.TrimSpace(*req.Name)
 		if name == "" {
-			httpx.Fail(w, r, httpx.BadRequest("name cannot be empty"))
+			httpx.Fail(c, httpx.BadRequest("name cannot be empty"))
 			return
 		}
 		updates["name"] = name
@@ -503,7 +503,7 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 	if req.PlannedStart != nil {
 		d, err := parseDate(*req.PlannedStart)
 		if err != nil {
-			httpx.Fail(w, r, httpx.BadRequest("planned_start must be a date in YYYY-MM-DD form"))
+			httpx.Fail(c, httpx.BadRequest("planned_start must be a date in YYYY-MM-DD form"))
 			return
 		}
 		updates["planned_start"] = d
@@ -511,40 +511,40 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 	if req.PlannedEnd != nil {
 		d, err := parseDate(*req.PlannedEnd)
 		if err != nil {
-			httpx.Fail(w, r, httpx.BadRequest("planned_end must be a date in YYYY-MM-DD form"))
+			httpx.Fail(c, httpx.BadRequest("planned_end must be a date in YYYY-MM-DD form"))
 			return
 		}
 		updates["planned_end"] = d
 	}
 	if len(updates) == 0 {
-		httpx.Fail(w, r, httpx.BadRequest("nothing to update"))
+		httpx.Fail(c, httpx.BadRequest("nothing to update"))
 		return
 	}
 
-	if err := s.db.WithContext(r.Context()).Model(&database.Project{}).
+	if err := s.db.WithContext(c.Request.Context()).Model(&database.Project{}).
 		Where("id = ?", a.ID).Updates(updates).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
-	s.handleGetProject(w, r)
+	s.handleGetProject(c)
 }
 
-func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), true)
+func (s *Server) handleDeleteProject(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), true)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
 	// Cascades to members, invitations, tasks, dependencies, closure, store,
 	// stock and deliveries. The PRJ code is never handed out again because
 	// project_seq is not rewound.
-	if err := s.db.WithContext(r.Context()).
+	if err := s.db.WithContext(c.Request.Context()).
 		Where("id = ?", a.ID).Delete(&database.Project{}).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
-	httpx.NoContent(w)
+	httpx.NoContent(c)
 }
 
 func parseDate(v string) (time.Time, error) {

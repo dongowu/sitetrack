@@ -3,12 +3,12 @@ package api
 import (
 	"context"
 	"errors"
-	"net/http"
 	"strings"
 	"time"
 
 	"github.com/dongowu/sitetrack/internal/database"
 	"github.com/dongowu/sitetrack/internal/httpx"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -25,9 +25,9 @@ type materialDTO struct {
 // catalogue
 // ---------------------------------------------------------------------------
 
-func (s *Server) handleListMaterials(w http.ResponseWriter, r *http.Request) {
-	pg := s.paging(r)
-	ctx := r.Context()
+func (s *Server) handleListMaterials(c *gin.Context) {
+	pg := s.paging(c)
+	ctx := c.Request.Context()
 
 	// These expressions are used with Model(&Material{}), whose implicit alias is
 	// "materials" rather than a short "m" — keep them unqualified so the two stay
@@ -37,29 +37,29 @@ func (s *Server) handleListMaterials(w http.ResponseWriter, r *http.Request) {
 		"category": "lower(category)",
 		"unit":     "lower(unit)",
 	}
-	expr, ok := orderBy[queryParam(r, "sort")]
+	expr, ok := orderBy[queryParam(c, "sort")]
 	if !ok {
 		expr = orderBy["name"]
 	}
 
 	query := s.db.WithContext(ctx).Model(&database.Material{})
-	if q := queryParam(r, "q"); q != "" {
+	if q := queryParam(c, "q"); q != "" {
 		query = query.Where("lower(name) LIKE ?", likePattern(q))
 	}
-	if cat := queryParam(r, "category"); cat != "" {
+	if cat := queryParam(c, "category"); cat != "" {
 		query = query.Where("lower(category) = lower(?)", cat)
 	}
 
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
 	var materials []database.Material
-	if err := query.Clauses(ordering(expr, direction(queryParam(r, "dir")))).
+	if err := query.Clauses(ordering(expr, direction(queryParam(c, "dir")))).
 		Limit(pg.Limit).Offset(pg.Offset).Find(&materials).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
@@ -67,7 +67,7 @@ func (s *Server) handleListMaterials(w http.ResponseWriter, r *http.Request) {
 	for _, m := range materials {
 		items = append(items, materialDTO{ID: m.ID.String(), Name: m.Name, Category: m.Category, Unit: m.Unit})
 	}
-	httpx.List(w, items, map[string]any{"total": total, "limit": pg.Limit, "offset": pg.Offset})
+	httpx.List(c, items, map[string]any{"total": total, "limit": pg.Limit, "offset": pg.Offset})
 }
 
 type materialRequest struct {
@@ -76,43 +76,43 @@ type materialRequest struct {
 	Unit     string `json:"unit"`
 }
 
-func (s *Server) handleCreateMaterial(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleCreateMaterial(c *gin.Context) {
 	var req materialRequest
-	if err := decodeJSON(r, &req); err != nil {
-		httpx.Fail(w, r, err)
+	if err := decodeJSON(c, &req); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	req.Category = strings.TrimSpace(req.Category)
 	req.Unit = strings.TrimSpace(req.Unit)
 	if req.Name == "" || req.Category == "" || req.Unit == "" {
-		httpx.Fail(w, r, httpx.BadRequest("name, category and unit are required"))
+		httpx.Fail(c, httpx.BadRequest("name, category and unit are required"))
 		return
 	}
 
 	m := database.Material{
 		ID: uuid.New(), Name: req.Name, Category: req.Category, Unit: req.Unit, CreatedAt: time.Now().UTC(),
 	}
-	if err := s.db.WithContext(r.Context()).Create(&m).Error; err != nil {
+	if err := s.db.WithContext(c.Request.Context()).Create(&m).Error; err != nil {
 		if errors.Is(err, gorm.ErrDuplicatedKey) {
-			httpx.Fail(w, r, httpx.Conflict("that material already exists in the catalogue"))
+			httpx.Fail(c, httpx.Conflict("that material already exists in the catalogue"))
 			return
 		}
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
-	httpx.Created(w, materialDTO{ID: m.ID.String(), Name: m.Name, Category: m.Category, Unit: m.Unit})
+	httpx.Created(c, materialDTO{ID: m.ID.String(), Name: m.Name, Category: m.Category, Unit: m.Unit})
 }
 
-func (s *Server) handleUpdateMaterial(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleUpdateMaterial(c *gin.Context) {
 	var req materialRequest
-	if err := decodeJSON(r, &req); err != nil {
-		httpx.Fail(w, r, err)
+	if err := decodeJSON(c, &req); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
-	materialID, err := parseUUID(r.PathValue("materialID"))
+	materialID, err := parseUUID(c.Param("materialID"))
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
 
@@ -127,55 +127,55 @@ func (s *Server) handleUpdateMaterial(w http.ResponseWriter, r *http.Request) {
 		updates["unit"] = v
 	}
 	if len(updates) == 0 {
-		httpx.Fail(w, r, httpx.BadRequest("nothing to update"))
+		httpx.Fail(c, httpx.BadRequest("nothing to update"))
 		return
 	}
 
-	result := s.db.WithContext(r.Context()).Model(&database.Material{}).
+	result := s.db.WithContext(c.Request.Context()).Model(&database.Material{}).
 		Where("id = ?", materialID).Updates(updates)
 	if result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrDuplicatedKey) {
-			httpx.Fail(w, r, httpx.Conflict("that material name is already taken"))
+			httpx.Fail(c, httpx.Conflict("that material name is already taken"))
 			return
 		}
-		httpx.Fail(w, r, httpx.Internal(result.Error))
+		httpx.Fail(c, httpx.Internal(result.Error))
 		return
 	}
 	if result.RowsAffected == 0 {
-		httpx.Fail(w, r, httpx.NotFound("material not found"))
+		httpx.Fail(c, httpx.NotFound("material not found"))
 		return
 	}
 
 	var m database.Material
-	if err := s.db.WithContext(r.Context()).Where("id = ?", materialID).Take(&m).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+	if err := s.db.WithContext(c.Request.Context()).Where("id = ?", materialID).Take(&m).Error; err != nil {
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
-	httpx.OK(w, materialDTO{ID: m.ID.String(), Name: m.Name, Category: m.Category, Unit: m.Unit})
+	httpx.OK(c, materialDTO{ID: m.ID.String(), Name: m.Name, Category: m.Category, Unit: m.Unit})
 }
 
 // handleDeleteMaterial refuses while stock or delivery lines still reference the
 // material: silently dropping history is worse than a clear conflict.
-func (s *Server) handleDeleteMaterial(w http.ResponseWriter, r *http.Request) {
-	materialID, err := parseUUID(r.PathValue("materialID"))
+func (s *Server) handleDeleteMaterial(c *gin.Context) {
+	materialID, err := parseUUID(c.Param("materialID"))
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	result := s.db.WithContext(r.Context()).Where("id = ?", materialID).Delete(&database.Material{})
+	result := s.db.WithContext(c.Request.Context()).Where("id = ?", materialID).Delete(&database.Material{})
 	if result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrForeignKeyViolated) {
-			httpx.Fail(w, r, httpx.Conflict("this material is still used by a store or a delivery"))
+			httpx.Fail(c, httpx.Conflict("this material is still used by a store or a delivery"))
 			return
 		}
-		httpx.Fail(w, r, httpx.Internal(result.Error))
+		httpx.Fail(c, httpx.Internal(result.Error))
 		return
 	}
 	if result.RowsAffected == 0 {
-		httpx.Fail(w, r, httpx.NotFound("material not found"))
+		httpx.Fail(c, httpx.NotFound("material not found"))
 		return
 	}
-	httpx.NoContent(w)
+	httpx.NoContent(c)
 }
 
 // ---------------------------------------------------------------------------
@@ -205,15 +205,15 @@ type stockRow struct {
 	LastDeliveryAt *time.Time `gorm:"column:last_delivery_at"`
 }
 
-func (s *Server) handleProjectStore(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), false)
+func (s *Server) handleProjectStore(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), false)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	pg := s.paging(r)
-	ctx := r.Context()
+	pg := s.paging(c)
+	ctx := c.Request.Context()
 
 	orderBy := map[string]string{
 		"name":          "lower(m.name)",
@@ -221,7 +221,7 @@ func (s *Server) handleProjectStore(w http.ResponseWriter, r *http.Request) {
 		"last_delivery": "s.last_delivery_at",
 		"category":      "lower(m.category)",
 	}
-	expr, ok := orderBy[queryParam(r, "sort")]
+	expr, ok := orderBy[queryParam(c, "sort")]
 	if !ok {
 		expr = orderBy["name"]
 	}
@@ -230,16 +230,16 @@ func (s *Server) handleProjectStore(w http.ResponseWriter, r *http.Request) {
 		Table("store_stock AS s").
 		Joins("JOIN materials m ON m.id = s.material_id").
 		Where("s.store_id = ?", a.StoreID)
-	if q := queryParam(r, "q"); q != "" {
+	if q := queryParam(c, "q"); q != "" {
 		query = query.Where("lower(m.name) LIKE ?", likePattern(q))
 	}
-	if cat := queryParam(r, "category"); cat != "" {
+	if cat := queryParam(c, "category"); cat != "" {
 		query = query.Where("lower(m.category) = lower(?)", cat)
 	}
 
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
@@ -247,9 +247,9 @@ func (s *Server) handleProjectStore(w http.ResponseWriter, r *http.Request) {
 	if err := query.
 		Select(`m.id AS material_id, m.name, m.category, m.unit,
 		        s.quantity::float8 AS quantity, s.last_delivery_at`).
-		Clauses(ordering(expr, direction(queryParam(r, "dir"))+" NULLS LAST")).
+		Clauses(ordering(expr, direction(queryParam(c, "dir"))+" NULLS LAST")).
 		Order("lower(m.name)").Limit(pg.Limit).Offset(pg.Offset).Scan(&rows).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
@@ -261,24 +261,24 @@ func (s *Server) handleProjectStore(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	httpx.List(w, items, map[string]any{
+	httpx.List(c, items, map[string]any{
 		"total": total, "limit": pg.Limit, "offset": pg.Offset,
 		"unread_notifications": s.unreadCount(ctx, p.UserID),
 	})
 }
 
 // requireCompanyStore gates every /company/* endpoint.
-func (s *Server) requireCompanyStore(w http.ResponseWriter, r *http.Request) (*Principal, uuid.UUID, bool) {
-	p := caller(r)
+func (s *Server) requireCompanyStore(c *gin.Context) (*Principal, uuid.UUID, bool) {
+	p := caller(c)
 	if !p.CanUseCompanyStore() {
-		httpx.Fail(w, r, httpx.Forbidden("only a company store manager can reach the company store"))
+		httpx.Fail(c, httpx.Forbidden("only a company store manager can reach the company store"))
 		return nil, uuid.Nil, false
 	}
 	var company database.Store
-	if err := s.db.WithContext(r.Context()).
+	if err := s.db.WithContext(c.Request.Context()).
 		Select("id").Where("kind = ?", database.StoreKindCompany).
 		Take(&company).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(errors.New("company store is missing")))
+		httpx.Fail(c, httpx.Internal(errors.New("company store is missing")))
 		return nil, uuid.Nil, false
 	}
 	return p, company.ID, true
@@ -292,19 +292,19 @@ const statusExpr = `(CASE
 	WHEN s.quantity <= COALESCE(s.reorder_point, 0) THEN 'low_stock'
 	ELSE 'available' END)`
 
-func (s *Server) handleCompanyStore(w http.ResponseWriter, r *http.Request) {
-	_, storeID, ok := s.requireCompanyStore(w, r)
+func (s *Server) handleCompanyStore(c *gin.Context) {
+	_, storeID, ok := s.requireCompanyStore(c)
 	if !ok {
 		return
 	}
-	pg := s.paging(r)
-	ctx := r.Context()
+	pg := s.paging(c)
+	ctx := c.Request.Context()
 
-	status := strings.ToLower(queryParam(r, "status"))
+	status := strings.ToLower(queryParam(c, "status"))
 	switch status {
 	case "", "out_of_stock", "low_stock", "available":
 	default:
-		httpx.Fail(w, r, httpx.BadRequest("status must be out_of_stock, low_stock or available"))
+		httpx.Fail(c, httpx.BadRequest("status must be out_of_stock, low_stock or available"))
 		return
 	}
 
@@ -314,7 +314,7 @@ func (s *Server) handleCompanyStore(w http.ResponseWriter, r *http.Request) {
 		"status":   statusExpr,
 		"category": "lower(m.category)",
 	}
-	expr, ok := orderBy[queryParam(r, "sort")]
+	expr, ok := orderBy[queryParam(c, "sort")]
 	if !ok {
 		expr = orderBy["name"]
 	}
@@ -323,19 +323,19 @@ func (s *Server) handleCompanyStore(w http.ResponseWriter, r *http.Request) {
 		Table("store_stock AS s").
 		Joins("JOIN materials m ON m.id = s.material_id").
 		Where("s.store_id = ?", storeID)
-	if q := queryParam(r, "q"); q != "" {
+	if q := queryParam(c, "q"); q != "" {
 		query = query.Where("lower(m.name) LIKE ?", likePattern(q))
 	}
 	if status != "" {
 		query = query.Where(statusExpr+" = ?", status)
 	}
-	if cat := queryParam(r, "category"); cat != "" {
+	if cat := queryParam(c, "category"); cat != "" {
 		query = query.Where("lower(m.category) = lower(?)", cat)
 	}
 
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
@@ -345,9 +345,9 @@ func (s *Server) handleCompanyStore(w http.ResponseWriter, r *http.Request) {
 		        s.quantity::float8 AS quantity, s.reorder_point::float8 AS reorder_point,
 		        ` + statusExpr + ` AS status,
 		        s.last_delivery_at`).
-		Clauses(ordering(expr, direction(queryParam(r, "dir"))+" NULLS LAST")).
+		Clauses(ordering(expr, direction(queryParam(c, "dir"))+" NULLS LAST")).
 		Order("lower(m.name)").Limit(pg.Limit).Offset(pg.Offset).Scan(&rows).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
@@ -357,7 +357,7 @@ func (s *Server) handleCompanyStore(w http.ResponseWriter, r *http.Request) {
 	}
 	transit, err := s.inTransitByMaterial(ctx, storeID, materialIDs)
 	if err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
@@ -370,7 +370,7 @@ func (s *Server) handleCompanyStore(w http.ResponseWriter, r *http.Request) {
 			Status: row.Status, QuantityInTransit: &inTransit, LastDeliveryAt: row.LastDeliveryAt,
 		})
 	}
-	httpx.List(w, items, map[string]any{"total": total, "limit": pg.Limit, "offset": pg.Offset})
+	httpx.List(c, items, map[string]any{"total": total, "limit": pg.Limit, "offset": pg.Offset})
 }
 
 // inTransitByMaterial reports how much of each material is sitting on a truck
@@ -424,80 +424,80 @@ type addStockRequest struct {
 }
 
 // handleAddStock is the only door through which new material enters SiteTrack.
-func (s *Server) handleAddStock(w http.ResponseWriter, r *http.Request) {
-	_, storeID, ok := s.requireCompanyStore(w, r)
+func (s *Server) handleAddStock(c *gin.Context) {
+	_, storeID, ok := s.requireCompanyStore(c)
 	if !ok {
 		return
 	}
 	var req addStockRequest
-	if err := decodeJSON(r, &req); err != nil {
-		httpx.Fail(w, r, err)
+	if err := decodeJSON(c, &req); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
 	if req.MaterialID == "" {
-		httpx.Fail(w, r, httpx.BadRequest("material_id is required"))
+		httpx.Fail(c, httpx.BadRequest("material_id is required"))
 		return
 	}
 	if req.Quantity == nil || *req.Quantity <= 0 {
-		httpx.Fail(w, r, httpx.BadRequest("quantity must be greater than zero"))
+		httpx.Fail(c, httpx.BadRequest("quantity must be greater than zero"))
 		return
 	}
 	materialID, err := parseUUID(req.MaterialID)
 	if err != nil {
-		httpx.Fail(w, r, httpx.NotFound("material not found"))
+		httpx.Fail(c, httpx.NotFound("material not found"))
 		return
 	}
 
-	ctx := r.Context()
+	ctx := c.Request.Context()
 	var exists int64
 	if err := s.db.WithContext(ctx).Model(&database.Material{}).
 		Where("id = ?", materialID).Count(&exists).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 	if exists == 0 {
-		httpx.Fail(w, r, httpx.NotFound("material not found"))
+		httpx.Fail(c, httpx.NotFound("material not found"))
 		return
 	}
 
 	if err := addStock(ctx, s.db, storeID, materialID, *req.Quantity); err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
 	item, err := s.stockItem(ctx, storeID, materialID)
 	if err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
-	httpx.OK(w, item)
+	httpx.OK(c, item)
 }
 
 type reorderPointRequest struct {
 	ReorderPoint *float64 `json:"reorder_point"`
 }
 
-func (s *Server) handleSetReorderPoint(w http.ResponseWriter, r *http.Request) {
-	_, storeID, ok := s.requireCompanyStore(w, r)
+func (s *Server) handleSetReorderPoint(c *gin.Context) {
+	_, storeID, ok := s.requireCompanyStore(c)
 	if !ok {
 		return
 	}
 	var req reorderPointRequest
-	if err := decodeJSON(r, &req); err != nil {
-		httpx.Fail(w, r, err)
+	if err := decodeJSON(c, &req); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
 	if req.ReorderPoint != nil && *req.ReorderPoint < 0 {
-		httpx.Fail(w, r, httpx.BadRequest("reorder_point cannot be negative"))
+		httpx.Fail(c, httpx.BadRequest("reorder_point cannot be negative"))
 		return
 	}
-	materialID, err := parseUUID(r.PathValue("materialID"))
+	materialID, err := parseUUID(c.Param("materialID"))
 	if err != nil {
-		httpx.Fail(w, r, httpx.NotFound("material not found"))
+		httpx.Fail(c, httpx.NotFound("material not found"))
 		return
 	}
 
-	ctx := r.Context()
+	ctx := c.Request.Context()
 	now := time.Now().UTC()
 	// The material must already be stocked for its reorder point to mean
 	// anything, so this upserts a zero quantity row when needed.
@@ -513,19 +513,19 @@ func (s *Server) handleSetReorderPoint(w http.ResponseWriter, r *http.Request) {
 	}).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrForeignKeyViolated) {
-			httpx.Fail(w, r, httpx.NotFound("material not found"))
+			httpx.Fail(c, httpx.NotFound("material not found"))
 			return
 		}
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
 	item, err := s.stockItem(ctx, storeID, materialID)
 	if err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
-	httpx.OK(w, item)
+	httpx.OK(c, item)
 }
 
 func (s *Server) stockItem(ctx context.Context, storeID, materialID uuid.UUID) (stockItemDTO, error) {

@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -14,102 +13,130 @@ import (
 	"github.com/dongowu/sitetrack/internal/auth"
 	"github.com/dongowu/sitetrack/internal/config"
 	"github.com/dongowu/sitetrack/internal/httpx"
+	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
 type Server struct {
-	db  *gorm.DB
-	cfg config.Config
-	mux *http.ServeMux
+	db     *gorm.DB
+	cfg    config.Config
+	router *gin.Engine
 }
 
 func NewServer(db *gorm.DB, cfg config.Config) *Server {
-	s := &Server{db: db, cfg: cfg, mux: http.NewServeMux()}
+	// Gin's own logger and recovery are replaced below: the logger would print a
+	// second line per request next to the structured one, and the default
+	// recovery writes a plain-text 500 that breaks the error envelope.
+	gin.DefaultWriter = ginWriter{}
+	gin.DefaultErrorWriter = ginWriter{}
+	gin.SetMode(gin.ReleaseMode)
+	// A typo in a JSON body is a 400, not a silently ignored field.
+	binding.EnableDecoderDisallowUnknownFields = true
+
+	s := &Server{db: db, cfg: cfg, router: gin.New()}
+	s.router.Use(s.recoverer(), s.requestLogger(), s.cors())
 	s.routes()
 	return s
 }
 
 func (s *Server) Handler() http.Handler {
-	return s.recoverer(s.requestLogger(s.cors(s.mux)))
+	return s.router
 }
+
+// ginWriter swallows what Gin prints directly so structured logs stay the only
+// output. Anything Gin would have written has already been logged by the
+// middleware with more context.
+type ginWriter struct{}
+
+func (ginWriter) Write(p []byte) (int, error) { return len(p), nil }
 
 // ---------------------------------------------------------------------------
 // routing
 // ---------------------------------------------------------------------------
 
 func (s *Server) routes() {
+	r := s.router
 	const p = "/api/v1"
 
 	// public
-	s.mux.HandleFunc("POST "+p+"/auth/register", s.handleRegister)
-	s.mux.HandleFunc("POST "+p+"/auth/login", s.handleLogin)
-	s.mux.HandleFunc("POST "+p+"/auth/refresh", s.handleRefresh)
-	s.mux.HandleFunc("GET "+p+"/health", s.handleHealth)
+	r.POST(p+"/auth/register", s.handleRegister)
+	r.POST(p+"/auth/login", s.handleLogin)
+	r.POST(p+"/auth/refresh", s.handleRefresh)
+	r.GET(p+"/health", s.handleHealth)
 
-	// authenticated
-	s.mux.HandleFunc("POST "+p+"/auth/logout", s.auth(s.handleLogout))
-	s.mux.HandleFunc("GET "+p+"/me", s.auth(s.handleMe))
-	s.mux.HandleFunc("PATCH "+p+"/me", s.auth(s.handleUpdateMe))
-	s.mux.HandleFunc("POST "+p+"/me/password", s.auth(s.handleChangePassword))
+	// Everything below needs a live session. Applied per route rather than via a
+	// group because the public routes above sit under the same prefix.
+	authed := func(h gin.HandlerFunc) []gin.HandlerFunc {
+		return []gin.HandlerFunc{s.requireAuth(), h}
+	}
+	route := func(method, path string, h gin.HandlerFunc) {
+		r.Handle(method, path, authed(h)...)
+	}
 
-	s.mux.HandleFunc("GET "+p+"/notifications", s.auth(s.handleListNotifications))
-	s.mux.HandleFunc("POST "+p+"/notifications/read", s.auth(s.handleMarkNotificationsRead))
-	s.mux.HandleFunc("POST "+p+"/invitations/{invitationID}/accept", s.auth(s.handleAcceptInvitation))
-	s.mux.HandleFunc("POST "+p+"/invitations/{invitationID}/reject", s.auth(s.handleRejectInvitation))
+	route(http.MethodPost, p+"/auth/logout", s.handleLogout)
+	route(http.MethodGet, p+"/me", s.handleMe)
+	route(http.MethodPatch, p+"/me", s.handleUpdateMe)
+	route(http.MethodPost, p+"/me/password", s.handleChangePassword)
 
-	s.mux.HandleFunc("GET "+p+"/materials", s.auth(s.handleListMaterials))
-	s.mux.HandleFunc("POST "+p+"/materials", s.auth(s.handleCreateMaterial))
-	s.mux.HandleFunc("PATCH "+p+"/materials/{materialID}", s.auth(s.handleUpdateMaterial))
-	s.mux.HandleFunc("DELETE "+p+"/materials/{materialID}", s.auth(s.handleDeleteMaterial))
+	route(http.MethodGet, p+"/notifications", s.handleListNotifications)
+	route(http.MethodPost, p+"/notifications/read", s.handleMarkNotificationsRead)
+	route(http.MethodPost, p+"/invitations/:invitationID/accept", s.handleAcceptInvitation)
+	route(http.MethodPost, p+"/invitations/:invitationID/reject", s.handleRejectInvitation)
 
-	s.mux.HandleFunc("GET "+p+"/users", s.auth(s.handleSearchUsers))
+	route(http.MethodGet, p+"/materials", s.handleListMaterials)
+	route(http.MethodPost, p+"/materials", s.handleCreateMaterial)
+	route(http.MethodPatch, p+"/materials/:materialID", s.handleUpdateMaterial)
+	route(http.MethodDelete, p+"/materials/:materialID", s.handleDeleteMaterial)
 
-	s.mux.HandleFunc("POST "+p+"/projects", s.auth(s.handleCreateProject))
-	s.mux.HandleFunc("GET "+p+"/projects", s.auth(s.handleListProjects))
-	s.mux.HandleFunc("GET "+p+"/projects/{projectCode}", s.auth(s.handleGetProject))
-	s.mux.HandleFunc("PATCH "+p+"/projects/{projectCode}", s.auth(s.handleUpdateProject))
-	s.mux.HandleFunc("DELETE "+p+"/projects/{projectCode}", s.auth(s.handleDeleteProject))
+	route(http.MethodGet, p+"/users", s.handleSearchUsers)
 
-	s.mux.HandleFunc("GET "+p+"/projects/{projectCode}/members", s.auth(s.handleListMembers))
-	s.mux.HandleFunc("PATCH "+p+"/projects/{projectCode}/members/{userID}", s.auth(s.handleUpdateMember))
-	s.mux.HandleFunc("DELETE "+p+"/projects/{projectCode}/members/{userID}", s.auth(s.handleRemoveMember))
-	s.mux.HandleFunc("POST "+p+"/projects/{projectCode}/invitations", s.auth(s.handleInvite))
-	s.mux.HandleFunc("DELETE "+p+"/projects/{projectCode}/invitations/{invitationID}", s.auth(s.handleWithdrawInvitation))
+	route(http.MethodPost, p+"/projects", s.handleCreateProject)
+	route(http.MethodGet, p+"/projects", s.handleListProjects)
+	route(http.MethodGet, p+"/projects/:projectCode", s.handleGetProject)
+	route(http.MethodPatch, p+"/projects/:projectCode", s.handleUpdateProject)
+	route(http.MethodDelete, p+"/projects/:projectCode", s.handleDeleteProject)
 
-	s.mux.HandleFunc("GET "+p+"/projects/{projectCode}/tasks", s.auth(s.handleListTasks))
-	s.mux.HandleFunc("POST "+p+"/projects/{projectCode}/tasks", s.auth(s.handleCreateTask))
-	s.mux.HandleFunc("GET "+p+"/projects/{projectCode}/tasks/{taskCode}", s.auth(s.handleGetTask))
-	s.mux.HandleFunc("PATCH "+p+"/projects/{projectCode}/tasks/{taskCode}", s.auth(s.handleUpdateTask))
-	s.mux.HandleFunc("DELETE "+p+"/projects/{projectCode}/tasks/{taskCode}", s.auth(s.handleDeleteTask))
-	s.mux.HandleFunc("POST "+p+"/projects/{projectCode}/tasks/{taskCode}/start", s.auth(s.handleTaskStart))
-	s.mux.HandleFunc("POST "+p+"/projects/{projectCode}/tasks/{taskCode}/done", s.auth(s.handleTaskDone))
-	s.mux.HandleFunc("POST "+p+"/projects/{projectCode}/tasks/{taskCode}/reopen", s.auth(s.handleTaskReopen))
-	s.mux.HandleFunc("GET "+p+"/projects/{projectCode}/tasks/{taskCode}/dependencies", s.auth(s.handleGetTaskGraph))
-	s.mux.HandleFunc("POST "+p+"/projects/{projectCode}/tasks/{taskCode}/dependencies", s.auth(s.handleAddDependency))
-	s.mux.HandleFunc("DELETE "+p+"/projects/{projectCode}/tasks/{taskCode}/dependencies/{dependsOnCode}", s.auth(s.handleRemoveDependency))
+	route(http.MethodGet, p+"/projects/:projectCode/members", s.handleListMembers)
+	route(http.MethodPatch, p+"/projects/:projectCode/members/:userID", s.handleUpdateMember)
+	route(http.MethodDelete, p+"/projects/:projectCode/members/:userID", s.handleRemoveMember)
+	route(http.MethodPost, p+"/projects/:projectCode/invitations", s.handleInvite)
+	route(http.MethodDelete, p+"/projects/:projectCode/invitations/:invitationID", s.handleWithdrawInvitation)
 
-	s.mux.HandleFunc("GET "+p+"/projects/{projectCode}/store", s.auth(s.handleProjectStore))
-	s.mux.HandleFunc("GET "+p+"/projects/{projectCode}/deliveries", s.auth(s.handleProjectDeliveries))
-	s.mux.HandleFunc("POST "+p+"/projects/{projectCode}/deliveries", s.auth(s.handleProjectCreateDelivery))
-	s.mux.HandleFunc("GET "+p+"/projects/{projectCode}/deliveries/{deliveryID}", s.auth(s.handleGetProjectDelivery))
-	s.mux.HandleFunc("POST "+p+"/projects/{projectCode}/deliveries/{deliveryID}/record", s.auth(s.handleProjectDeliveryRecord))
-	s.mux.HandleFunc("POST "+p+"/projects/{projectCode}/deliveries/{deliveryID}/reject", s.auth(s.handleProjectDeliveryReject))
-	s.mux.HandleFunc("POST "+p+"/projects/{projectCode}/deliveries/{deliveryID}/cancel", s.auth(s.handleProjectDeliveryCancel))
+	route(http.MethodGet, p+"/projects/:projectCode/tasks", s.handleListTasks)
+	route(http.MethodPost, p+"/projects/:projectCode/tasks", s.handleCreateTask)
+	route(http.MethodGet, p+"/projects/:projectCode/tasks/:taskCode", s.handleGetTask)
+	route(http.MethodPatch, p+"/projects/:projectCode/tasks/:taskCode", s.handleUpdateTask)
+	route(http.MethodDelete, p+"/projects/:projectCode/tasks/:taskCode", s.handleDeleteTask)
+	route(http.MethodPost, p+"/projects/:projectCode/tasks/:taskCode/start", s.handleTaskStart)
+	route(http.MethodPost, p+"/projects/:projectCode/tasks/:taskCode/done", s.handleTaskDone)
+	route(http.MethodPost, p+"/projects/:projectCode/tasks/:taskCode/reopen", s.handleTaskReopen)
+	route(http.MethodGet, p+"/projects/:projectCode/tasks/:taskCode/dependencies", s.handleGetTaskGraph)
+	route(http.MethodPost, p+"/projects/:projectCode/tasks/:taskCode/dependencies", s.handleAddDependency)
+	route(http.MethodDelete, p+"/projects/:projectCode/tasks/:taskCode/dependencies/:dependsOnCode", s.handleRemoveDependency)
 
-	s.mux.HandleFunc("GET "+p+"/company/store", s.auth(s.handleCompanyStore))
-	s.mux.HandleFunc("POST "+p+"/company/store/stock", s.auth(s.handleAddStock))
-	s.mux.HandleFunc("PATCH "+p+"/company/store/stock/{materialID}", s.auth(s.handleSetReorderPoint))
-	s.mux.HandleFunc("GET "+p+"/company/deliveries", s.auth(s.handleCompanyDeliveries))
-	s.mux.HandleFunc("POST "+p+"/company/deliveries", s.auth(s.handleCompanyCreateDelivery))
-	s.mux.HandleFunc("GET "+p+"/company/deliveries/{deliveryID}", s.auth(s.handleGetCompanyDelivery))
-	s.mux.HandleFunc("POST "+p+"/company/deliveries/{deliveryID}/record", s.auth(s.handleCompanyDeliveryRecord))
-	s.mux.HandleFunc("POST "+p+"/company/deliveries/{deliveryID}/reject", s.auth(s.handleCompanyDeliveryReject))
-	s.mux.HandleFunc("POST "+p+"/company/deliveries/{deliveryID}/cancel", s.auth(s.handleCompanyDeliveryCancel))
+	route(http.MethodGet, p+"/projects/:projectCode/store", s.handleProjectStore)
+	route(http.MethodGet, p+"/projects/:projectCode/deliveries", s.handleProjectDeliveries)
+	route(http.MethodPost, p+"/projects/:projectCode/deliveries", s.handleProjectCreateDelivery)
+	route(http.MethodGet, p+"/projects/:projectCode/deliveries/:deliveryID", s.handleGetProjectDelivery)
+	route(http.MethodPost, p+"/projects/:projectCode/deliveries/:deliveryID/record", s.handleProjectDeliveryRecord)
+	route(http.MethodPost, p+"/projects/:projectCode/deliveries/:deliveryID/reject", s.handleProjectDeliveryReject)
+	route(http.MethodPost, p+"/projects/:projectCode/deliveries/:deliveryID/cancel", s.handleProjectDeliveryCancel)
 
-	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		httpx.Fail(w, r, httpx.NotFound("no route for %s %s", r.Method, r.URL.Path))
+	route(http.MethodGet, p+"/company/store", s.handleCompanyStore)
+	route(http.MethodPost, p+"/company/store/stock", s.handleAddStock)
+	route(http.MethodPatch, p+"/company/store/stock/:materialID", s.handleSetReorderPoint)
+	route(http.MethodGet, p+"/company/deliveries", s.handleCompanyDeliveries)
+	route(http.MethodPost, p+"/company/deliveries", s.handleCompanyCreateDelivery)
+	route(http.MethodGet, p+"/company/deliveries/:deliveryID", s.handleGetCompanyDelivery)
+	route(http.MethodPost, p+"/company/deliveries/:deliveryID/record", s.handleCompanyDeliveryRecord)
+	route(http.MethodPost, p+"/company/deliveries/:deliveryID/reject", s.handleCompanyDeliveryReject)
+	route(http.MethodPost, p+"/company/deliveries/:deliveryID/cancel", s.handleCompanyDeliveryCancel)
+
+	r.NoRoute(func(c *gin.Context) {
+		httpx.Fail(c, httpx.NotFound("no route for %s %s", c.Request.Method, c.Request.URL.Path))
 	})
 }
 
@@ -117,7 +144,7 @@ func (s *Server) routes() {
 // middleware
 // ---------------------------------------------------------------------------
 
-type principalKey struct{}
+const principalKey = "sitetrack.principal"
 
 // Principal is the authenticated caller, refreshed from the database on every
 // request so a revoked session or a changed role is effective on the next call.
@@ -143,23 +170,22 @@ type principalRow struct {
 	SessionID uuid.UUID
 }
 
-func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		header := r.Header.Get("Authorization")
-		raw, ok := strings.CutPrefix(header, "Bearer ")
+func (s *Server) requireAuth() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		raw, ok := strings.CutPrefix(c.GetHeader("Authorization"), "Bearer ")
 		if !ok || raw == "" {
-			httpx.Fail(w, r, httpx.Unauthorized("missing bearer token"))
+			httpx.Fail(c, httpx.Unauthorized("missing bearer token"))
 			return
 		}
 		claims, err := auth.ParseAccess(s.cfg.JWTSecret, raw)
 		if err != nil {
-			httpx.Fail(w, r, httpx.Unauthorized("invalid or expired access token"))
+			httpx.Fail(c, httpx.Unauthorized("invalid or expired access token"))
 			return
 		}
 
 		// One round trip: is the session still alive, and who is the user now?
 		var row principalRow
-		err = s.db.WithContext(r.Context()).
+		err = s.db.WithContext(c.Request.Context()).
 			Table("sessions").
 			Select("users.id, users.name, users.email, users.app_role, sessions.id AS session_id").
 			Joins("JOIN users ON users.id = sessions.user_id").
@@ -167,86 +193,80 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 			Where("sessions.revoked_at IS NULL AND sessions.expires_at > now() AND users.deleted_at IS NULL").
 			Take(&row).Error
 		if err != nil {
-			httpx.Fail(w, r, httpx.Unauthorized("session is no longer valid"))
+			httpx.Fail(c, httpx.Unauthorized("session is no longer valid"))
 			return
 		}
 
-		p := &Principal{
+		c.Set(principalKey, &Principal{
 			UserID:    row.ID,
 			Name:      row.Name,
 			Email:     row.Email,
 			Role:      row.AppRole,
 			SessionID: row.SessionID,
-		}
-		next(w, r.WithContext(context.WithValue(r.Context(), principalKey{}, p)))
+		})
+		c.Next()
 	}
 }
 
-func caller(r *http.Request) *Principal {
-	p, _ := r.Context().Value(principalKey{}).(*Principal)
+func caller(c *gin.Context) *Principal {
+	v, ok := c.Get(principalKey)
+	if !ok {
+		return nil
+	}
+	p, _ := v.(*Principal)
 	return p
 }
 
-func (s *Server) recoverer(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if rec := recover(); rec != nil {
-				slog.Error("panic", "rec", rec, "path", r.URL.Path, "stack", string(debug.Stack()))
-				httpx.Fail(w, r, httpx.Internal(errors.New("panic")))
-			}
-		}()
-		next.ServeHTTP(w, r)
+func (s *Server) recoverer() gin.HandlerFunc {
+	return gin.CustomRecovery(func(c *gin.Context, rec any) {
+		slog.Error("panic",
+			"rec", rec,
+			"method", c.Request.Method,
+			"path", c.Request.URL.Path,
+			"stack", string(debug.Stack()))
+		httpx.Fail(c, httpx.Internal(errors.New("panic")))
 	})
 }
 
-type statusRecorder struct {
-	http.ResponseWriter
-	status int
-}
-
-func (s *statusRecorder) WriteHeader(code int) {
-	s.status = code
-	s.ResponseWriter.WriteHeader(code)
-}
-
-func (s *Server) requestLogger(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func (s *Server) requestLogger() gin.HandlerFunc {
+	return func(c *gin.Context) {
 		start := time.Now()
-		rec := &statusRecorder{ResponseWriter: w, status: 200}
-		next.ServeHTTP(rec, r)
-		if strings.HasPrefix(r.URL.Path, "/api/") {
+		c.Next()
+		if strings.HasPrefix(c.Request.URL.Path, "/api/") {
 			slog.Info("request",
-				"method", r.Method,
-				"path", r.URL.Path,
-				"status", rec.status,
+				"method", c.Request.Method,
+				"path", c.Request.URL.Path,
+				"status", c.Writer.Status(),
 				"dur_ms", time.Since(start).Milliseconds())
 		}
-	})
+	}
 }
 
 // cors keeps the frontend team unblocked during development.
-func (s *Server) cors(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-		w.Header().Set("Access-Control-Max-Age", "86400")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
+func (s *Server) cors() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		h := c.Writer.Header()
+		h.Set("Access-Control-Allow-Origin", "*")
+		h.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		h.Set("Access-Control-Max-Age", "86400")
+		if c.Request.Method == http.MethodOptions {
+			c.AbortWithStatus(http.StatusNoContent)
 			return
 		}
-		next.ServeHTTP(w, r)
-	})
+		c.Next()
+	}
 }
 
 // ---------------------------------------------------------------------------
 // shared helpers
 // ---------------------------------------------------------------------------
 
-func decodeJSON(r *http.Request, dst any) error {
-	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(dst); err != nil {
+// decodeJSON binds a JSON body, capped at 1 MiB and rejecting unknown fields so
+// a misspelled key is reported instead of ignored.
+func decodeJSON(c *gin.Context, dst any) error {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
+	if err := c.ShouldBindWith(dst, binding.JSON); err != nil {
 		return httpx.BadRequest("invalid JSON body: %v", err)
 	}
 	return nil
@@ -257,28 +277,27 @@ type paging struct {
 	Offset int
 }
 
-func (s *Server) paging(r *http.Request) paging {
-	q := r.URL.Query()
+func (s *Server) paging(c *gin.Context) paging {
 	limit := 20
-	if v, err := strconv.Atoi(q.Get("limit")); err == nil && v > 0 {
+	if v, err := strconv.Atoi(c.Query("limit")); err == nil && v > 0 {
 		limit = v
 	}
 	if limit > s.cfg.MaxPageSize {
 		limit = s.cfg.MaxPageSize
 	}
 	offset := 0
-	if v, err := strconv.Atoi(q.Get("offset")); err == nil && v > 0 {
+	if v, err := strconv.Atoi(c.Query("offset")); err == nil && v > 0 {
 		offset = v
 	}
 	return paging{Limit: limit, Offset: offset}
 }
 
-func queryParam(r *http.Request, key string) string {
-	return strings.TrimSpace(r.URL.Query().Get(key))
+func queryParam(c *gin.Context, key string) string {
+	return strings.TrimSpace(c.Query(key))
 }
 
-func boolParam(r *http.Request, key string) bool {
-	switch strings.ToLower(queryParam(r, key)) {
+func boolParam(c *gin.Context, key string) bool {
+	switch strings.ToLower(queryParam(c, key)) {
 	case "1", "true", "yes":
 		return true
 	}
@@ -286,8 +305,8 @@ func boolParam(r *http.Request, key string) bool {
 }
 
 // dateParam parses YYYY-MM-DD. An empty string yields nil.
-func dateParam(r *http.Request, key string) (*time.Time, error) {
-	raw := queryParam(r, key)
+func dateParam(c *gin.Context, key string) (*time.Time, error) {
+	raw := queryParam(c, key)
 	if raw == "" {
 		return nil, nil
 	}

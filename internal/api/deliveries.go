@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"math"
-	"net/http"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/dongowu/sitetrack/internal/database"
 	"github.com/dongowu/sitetrack/internal/httpx"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -58,33 +58,33 @@ type deliveryRow struct {
 	ResolvedBy  *string    `gorm:"column:resolved_by"`
 }
 
-func (s *Server) handleProjectDeliveries(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), false)
+func (s *Server) handleProjectDeliveries(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), false)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	s.listDeliveries(w, r, deliveryScope{viewerStoreID: a.StoreID, projectID: a.ID})
+	s.listDeliveries(c, deliveryScope{viewerStoreID: a.StoreID, projectID: a.ID})
 }
 
-func (s *Server) handleCompanyDeliveries(w http.ResponseWriter, r *http.Request) {
-	_, storeID, ok := s.requireCompanyStore(w, r)
+func (s *Server) handleCompanyDeliveries(c *gin.Context) {
+	_, storeID, ok := s.requireCompanyStore(c)
 	if !ok {
 		return
 	}
-	s.listDeliveries(w, r, deliveryScope{viewerStoreID: storeID})
+	s.listDeliveries(c, deliveryScope{viewerStoreID: storeID})
 }
 
-func (s *Server) listDeliveries(w http.ResponseWriter, r *http.Request, scope deliveryScope) {
-	pg := s.paging(r)
-	ctx := r.Context()
+func (s *Server) listDeliveries(c *gin.Context, scope deliveryScope) {
+	pg := s.paging(c)
+	ctx := c.Request.Context()
 
-	dir := strings.ToLower(queryParam(r, "direction"))
+	dir := strings.ToLower(queryParam(c, "direction"))
 	switch dir {
 	case "", "in", "out", "incoming", "outgoing":
 	default:
-		httpx.Fail(w, r, httpx.BadRequest("direction must be in, out, incoming or outgoing"))
+		httpx.Fail(c, httpx.BadRequest("direction must be in, out, incoming or outgoing"))
 		return
 	}
 	if dir == "incoming" {
@@ -94,22 +94,22 @@ func (s *Server) listDeliveries(w http.ResponseWriter, r *http.Request, scope de
 		dir = "out"
 	}
 
-	status := strings.ToLower(queryParam(r, "status"))
+	status := strings.ToLower(queryParam(c, "status"))
 	switch status {
 	case "", "in_transit", "delivered", "rejected", "cancelled":
 	default:
-		httpx.Fail(w, r, httpx.BadRequest("status must be in_transit, delivered, rejected or cancelled"))
+		httpx.Fail(c, httpx.BadRequest("status must be in_transit, delivered, rejected or cancelled"))
 		return
 	}
 
-	from, err := dateParam(r, "from")
+	from, err := dateParam(c, "from")
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	to, err := dateParam(r, "to")
+	to, err := dateParam(c, "to")
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
 
@@ -136,14 +136,14 @@ func (s *Server) listDeliveries(w http.ResponseWriter, r *http.Request, scope de
 		base = base.Where("d.created_at < ?", to.AddDate(0, 0, 1))
 	}
 	if scope.projectID == uuid.Nil {
-		if proj := queryParam(r, "project"); proj != "" {
+		if proj := queryParam(c, "project"); proj != "" {
 			base = base.Where("p.code = ?", strings.ToUpper(proj))
 		}
 	}
 
 	var total int64
 	if err := base.Count(&total).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
@@ -157,7 +157,7 @@ func (s *Server) listDeliveries(w http.ResponseWriter, r *http.Request, scope de
 		Order("d.created_at DESC, d.id DESC").
 		Limit(pg.Limit).Offset(pg.Offset).Scan(&rows).Error
 	if err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
@@ -182,7 +182,7 @@ func (s *Server) listDeliveries(w http.ResponseWriter, r *http.Request, scope de
 	if len(ids) > 0 {
 		lines, err := s.deliveryLines(ctx, ids)
 		if err != nil {
-			httpx.Fail(w, r, httpx.Internal(err))
+			httpx.Fail(c, httpx.Internal(err))
 			return
 		}
 		for i := range items {
@@ -193,8 +193,8 @@ func (s *Server) listDeliveries(w http.ResponseWriter, r *http.Request, scope de
 		}
 	}
 
-	p := caller(r)
-	httpx.List(w, items, map[string]any{
+	p := caller(c)
+	httpx.List(c, items, map[string]any{
 		"total": total, "limit": pg.Limit, "offset": pg.Offset,
 		"unread_notifications": s.unreadCount(ctx, p.UserID),
 	})
@@ -254,33 +254,33 @@ type createDeliveryRequest struct {
 
 // handleProjectCreateDelivery sends material from the project store back to the
 // company store. Project stores never deliver to each other.
-func (s *Server) handleProjectCreateDelivery(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), false)
+func (s *Server) handleProjectCreateDelivery(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), false)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
 	var req createDeliveryRequest
-	if err := decodeJSON(r, &req); err != nil {
-		httpx.Fail(w, r, err)
+	if err := decodeJSON(c, &req); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
 
-	_, companyStoreID, ok := s.requireCompanyStore(w, r)
+	_, companyStoreID, ok := s.requireCompanyStore(c)
 	if !ok {
 		// The company store row must exist, but a project member is allowed to
 		// send material back to it without being a store manager.
 		var company database.Store
-		if err := s.db.WithContext(r.Context()).Select("id").
+		if err := s.db.WithContext(c.Request.Context()).Select("id").
 			Where("kind = ?", database.StoreKindCompany).Take(&company).Error; err != nil {
-			httpx.Fail(w, r, httpx.Internal(errors.New("company store is missing")))
+			httpx.Fail(c, httpx.Internal(errors.New("company store is missing")))
 			return
 		}
 		companyStoreID = company.ID
 	}
 
-	d, err := s.createDelivery(r.Context(), p, deliveryCreate{
+	d, err := s.createDelivery(c.Request.Context(), p, deliveryCreate{
 		projectID:     a.ID,
 		projectCode:   a.Code,
 		projectName:   a.Name,
@@ -292,49 +292,49 @@ func (s *Server) handleProjectCreateDelivery(w http.ResponseWriter, r *http.Requ
 		lines:         req.Lines,
 	})
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	httpx.Created(w, d)
+	httpx.Created(c, d)
 }
 
 // handleCompanyCreateDelivery sends material from the company store to a project.
-func (s *Server) handleCompanyCreateDelivery(w http.ResponseWriter, r *http.Request) {
-	p, companyStoreID, ok := s.requireCompanyStore(w, r)
+func (s *Server) handleCompanyCreateDelivery(c *gin.Context) {
+	p, companyStoreID, ok := s.requireCompanyStore(c)
 	if !ok {
 		return
 	}
 	var req createDeliveryRequest
-	if err := decodeJSON(r, &req); err != nil {
-		httpx.Fail(w, r, err)
+	if err := decodeJSON(c, &req); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
 	if strings.TrimSpace(req.ProjectID) == "" {
-		httpx.Fail(w, r, httpx.BadRequest("project_id is required"))
+		httpx.Fail(c, httpx.BadRequest("project_id is required"))
 		return
 	}
 
 	var target projectAccess
-	err := s.db.WithContext(r.Context()).
+	err := s.db.WithContext(c.Request.Context()).
 		Table("projects AS p").
 		Select("p.id, p.code, p.name, st.id AS store_id").
 		Joins("LEFT JOIN stores st ON st.project_id = p.id").
 		Where("p.code = upper(?)", strings.TrimSpace(req.ProjectID)).
 		Take(&target).Error
 	if isNotFound(err) {
-		httpx.Fail(w, r, httpx.NotFound("project not found"))
+		httpx.Fail(c, httpx.NotFound("project not found"))
 		return
 	}
 	if err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 	if target.StoreID == uuid.Nil {
-		httpx.Fail(w, r, httpx.NotFound("project not found"))
+		httpx.Fail(c, httpx.NotFound("project not found"))
 		return
 	}
 
-	d, err := s.createDelivery(r.Context(), p, deliveryCreate{
+	d, err := s.createDelivery(c.Request.Context(), p, deliveryCreate{
 		projectID:     target.ID,
 		projectCode:   target.Code,
 		projectName:   target.Name,
@@ -346,10 +346,10 @@ func (s *Server) handleCompanyCreateDelivery(w http.ResponseWriter, r *http.Requ
 		lines:         req.Lines,
 	})
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	httpx.Created(w, d)
+	httpx.Created(c, d)
 }
 
 type deliveryCreate struct {
@@ -476,56 +476,56 @@ func touchLastDelivery(ctx context.Context, tx *gorm.DB, storeID uuid.UUID, mate
 // transitions
 // ---------------------------------------------------------------------------
 
-func (s *Server) handleProjectDeliveryRecord(w http.ResponseWriter, r *http.Request) {
-	s.deliveryTransition(w, r, "record", false)
+func (s *Server) handleProjectDeliveryRecord(c *gin.Context) {
+	s.deliveryTransition(c, "record", false)
 }
 
-func (s *Server) handleProjectDeliveryReject(w http.ResponseWriter, r *http.Request) {
-	s.deliveryTransition(w, r, "reject", false)
+func (s *Server) handleProjectDeliveryReject(c *gin.Context) {
+	s.deliveryTransition(c, "reject", false)
 }
 
-func (s *Server) handleProjectDeliveryCancel(w http.ResponseWriter, r *http.Request) {
-	s.deliveryTransition(w, r, "cancel", false)
+func (s *Server) handleProjectDeliveryCancel(c *gin.Context) {
+	s.deliveryTransition(c, "cancel", false)
 }
 
-func (s *Server) handleCompanyDeliveryRecord(w http.ResponseWriter, r *http.Request) {
-	s.deliveryTransition(w, r, "record", true)
+func (s *Server) handleCompanyDeliveryRecord(c *gin.Context) {
+	s.deliveryTransition(c, "record", true)
 }
 
-func (s *Server) handleCompanyDeliveryReject(w http.ResponseWriter, r *http.Request) {
-	s.deliveryTransition(w, r, "reject", true)
+func (s *Server) handleCompanyDeliveryReject(c *gin.Context) {
+	s.deliveryTransition(c, "reject", true)
 }
 
-func (s *Server) handleCompanyDeliveryCancel(w http.ResponseWriter, r *http.Request) {
-	s.deliveryTransition(w, r, "cancel", true)
+func (s *Server) handleCompanyDeliveryCancel(c *gin.Context) {
+	s.deliveryTransition(c, "cancel", true)
 }
 
 // deliveryTransition applies record, reject or cancel. Every branch moves stock
 // and writes the delivery status in one transaction, so a delivery is either
 // fully applied or not at all.
-func (s *Server) deliveryTransition(w http.ResponseWriter, r *http.Request, action string, company bool) {
-	p := caller(r)
-	ctx := r.Context()
+func (s *Server) deliveryTransition(c *gin.Context, action string, company bool) {
+	p := caller(c)
+	ctx := c.Request.Context()
 
 	var viewerStoreID uuid.UUID
 	if company {
-		_, storeID, ok := s.requireCompanyStore(w, r)
+		_, storeID, ok := s.requireCompanyStore(c)
 		if !ok {
 			return
 		}
 		viewerStoreID = storeID
 	} else {
-		a, err := s.projectAccess(ctx, p, r.PathValue("projectCode"), false)
+		a, err := s.projectAccess(ctx, p, c.Param("projectCode"), false)
 		if err != nil {
-			httpx.Fail(w, r, err)
+			httpx.Fail(c, err)
 			return
 		}
 		viewerStoreID = a.StoreID
 	}
 
-	deliveryID, err := parseUUID(r.PathValue("deliveryID"))
+	deliveryID, err := parseUUID(c.Param("deliveryID"))
 	if err != nil {
-		httpx.Fail(w, r, httpx.NotFound("delivery not found"))
+		httpx.Fail(c, httpx.NotFound("delivery not found"))
 		return
 	}
 
@@ -595,14 +595,14 @@ func (s *Server) deliveryTransition(w http.ResponseWriter, r *http.Request, acti
 			}).Error
 	})
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
 
 	if company {
-		s.handleGetCompanyDelivery(w, r)
+		s.handleGetCompanyDelivery(c)
 	} else {
-		s.handleGetProjectDelivery(w, r)
+		s.handleGetProjectDelivery(c)
 	}
 }
 
@@ -610,32 +610,32 @@ func (s *Server) deliveryTransition(w http.ResponseWriter, r *http.Request, acti
 // single delivery
 // ---------------------------------------------------------------------------
 
-func (s *Server) handleGetProjectDelivery(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), false)
+func (s *Server) handleGetProjectDelivery(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), false)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	s.getDelivery(w, r, a.StoreID, a.ID)
+	s.getDelivery(c, a.StoreID, a.ID)
 }
 
-func (s *Server) handleGetCompanyDelivery(w http.ResponseWriter, r *http.Request) {
-	_, storeID, ok := s.requireCompanyStore(w, r)
+func (s *Server) handleGetCompanyDelivery(c *gin.Context) {
+	_, storeID, ok := s.requireCompanyStore(c)
 	if !ok {
 		return
 	}
-	s.getDelivery(w, r, storeID, uuid.Nil)
+	s.getDelivery(c, storeID, uuid.Nil)
 }
 
-func (s *Server) getDelivery(w http.ResponseWriter, r *http.Request, viewerStoreID, projectID uuid.UUID) {
-	deliveryID, err := parseUUID(r.PathValue("deliveryID"))
+func (s *Server) getDelivery(c *gin.Context, viewerStoreID, projectID uuid.UUID) {
+	deliveryID, err := parseUUID(c.Param("deliveryID"))
 	if err != nil {
-		httpx.Fail(w, r, httpx.NotFound("delivery not found"))
+		httpx.Fail(c, httpx.NotFound("delivery not found"))
 		return
 	}
 
-	query := s.db.WithContext(r.Context()).
+	query := s.db.WithContext(c.Request.Context()).
 		Table("deliveries AS d").
 		Select(`d.id, p.code AS project_code, p.name AS project_name,
 		        (d.to_store_id = ?) AS incoming, d.status, d.created_at, d.resolved_at,
@@ -650,7 +650,7 @@ func (s *Server) getDelivery(w http.ResponseWriter, r *http.Request, viewerStore
 
 	var row deliveryRow
 	if err := query.Take(&row).Error; err != nil {
-		httpx.Fail(w, r, httpx.NotFound("delivery not found"))
+		httpx.Fail(c, httpx.NotFound("delivery not found"))
 		return
 	}
 
@@ -666,14 +666,14 @@ func (s *Server) getDelivery(w http.ResponseWriter, r *http.Request, viewerStore
 	}
 	d.AllowedActions = deliveryActions(d.Status, row.Incoming)
 
-	lines, err := s.deliveryLines(r.Context(), []uuid.UUID{row.ID})
+	lines, err := s.deliveryLines(c.Request.Context(), []uuid.UUID{row.ID})
 	if err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 	d.Lines = lines[d.ID]
 	if d.Lines == nil {
 		d.Lines = []deliveryLineDTO{}
 	}
-	httpx.OK(w, d)
+	httpx.OK(c, d)
 }

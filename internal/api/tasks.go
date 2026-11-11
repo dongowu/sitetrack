@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/dongowu/sitetrack/internal/database"
 	"github.com/dongowu/sitetrack/internal/httpx"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -88,32 +88,32 @@ var taskFlagsExpr = fmt.Sprintf(`(tasks.status <> '%[1]s' AND (tasks.planned_end
 // handleListTasks answers with one statement: the flags, the dependent count,
 // the filters and the total row count are all resolved in the database, because
 // doing any of them in Go means one round trip per task on a project with 3,000.
-func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), false)
+func (s *Server) handleListTasks(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), false)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	pg := s.paging(r)
+	pg := s.paging(c)
 
-	status := queryParam(r, "status")
+	status := queryParam(c, "status")
 	if status != "" && status != statusNotStarted && status != statusInProgress && status != statusDone {
-		httpx.Fail(w, r, httpx.BadRequest("status must be not_started, in_progress or done"))
+		httpx.Fail(c, httpx.BadRequest("status must be not_started, in_progress or done"))
 		return
 	}
-	from, err := dateParam(r, "from")
+	from, err := dateParam(c, "from")
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	to, err := dateParam(r, "to")
+	to, err := dateParam(c, "to")
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
 	search := ""
-	if q := queryParam(r, "q"); q != "" {
+	if q := queryParam(c, "q"); q != "" {
 		search = likePattern(q)
 	}
 
@@ -124,12 +124,12 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		"end_date":   "planned_end",
 		"dependents": "dependents",
 	}
-	expr, ok := orderBy[queryParam(r, "sort")]
+	expr, ok := orderBy[queryParam(c, "sort")]
 	if !ok {
 		expr = "seq"
 	}
 
-	ctx := r.Context()
+	ctx := c.Request.Context()
 	db := s.db.WithContext(ctx)
 
 	base := db.Model(&database.Task{}).
@@ -145,10 +145,10 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	if status != "" {
 		query = query.Where("base.status = ?", status)
 	}
-	if boolParam(r, "late") {
+	if boolParam(c, "late") {
 		query = query.Where("base.is_late")
 	}
-	if boolParam(r, "blocked") {
+	if boolParam(c, "blocked") {
 		query = query.Where("base.is_blocked")
 	}
 	if from != nil {
@@ -164,12 +164,12 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	var rows []taskListRow
 	if err := query.
 		Clauses(clause.OrderBy{Expression: clause.Expr{
-			SQL:                expr + " " + direction(queryParam(r, "dir")) + ", seq ASC",
+			SQL:                expr + " " + direction(queryParam(c, "dir")) + ", seq ASC",
 			WithoutParentheses: true,
 		}}).
 		Limit(pg.Limit).Offset(pg.Offset).
 		Scan(&rows).Error; err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
@@ -190,7 +190,7 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	if len(ids) > 0 {
 		direct, err := s.directDependencies(ctx, ids)
 		if err != nil {
-			httpx.Fail(w, r, httpx.Internal(err))
+			httpx.Fail(c, httpx.Internal(err))
 			return
 		}
 		for i := range items {
@@ -204,7 +204,7 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	if len(rows) > 0 {
 		total = rows[0].TotalRows
 	}
-	httpx.List(w, items, map[string]any{
+	httpx.List(c, items, map[string]any{
 		"total":                total,
 		"limit":                pg.Limit,
 		"offset":               pg.Offset,
@@ -244,39 +244,39 @@ type createTaskRequest struct {
 	PlannedEnd   string `json:"planned_end"`
 }
 
-func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), false)
+func (s *Server) handleCreateTask(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), false)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
 	var req createTaskRequest
-	if err := decodeJSON(r, &req); err != nil {
-		httpx.Fail(w, r, err)
+	if err := decodeJSON(c, &req); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	if req.Name == "" {
-		httpx.Fail(w, r, httpx.BadRequest("name is required"))
+		httpx.Fail(c, httpx.BadRequest("name is required"))
 		return
 	}
 	start, err := parseDate(req.PlannedStart)
 	if err != nil {
-		httpx.Fail(w, r, httpx.BadRequest("planned_start must be a date in YYYY-MM-DD form"))
+		httpx.Fail(c, httpx.BadRequest("planned_start must be a date in YYYY-MM-DD form"))
 		return
 	}
 	end, err := parseDate(req.PlannedEnd)
 	if err != nil {
-		httpx.Fail(w, r, httpx.BadRequest("planned_end must be a date in YYYY-MM-DD form"))
+		httpx.Fail(c, httpx.BadRequest("planned_end must be a date in YYYY-MM-DD form"))
 		return
 	}
 	if end.Before(start) {
-		httpx.Fail(w, r, httpx.BadRequest("planned_end cannot be before planned_start"))
+		httpx.Fail(c, httpx.BadRequest("planned_end cannot be before planned_start"))
 		return
 	}
 
-	ctx := r.Context()
+	ctx := c.Request.Context()
 	var task database.Task
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// A single UPDATE ... RETURNING hands out each number exactly once; the
@@ -308,32 +308,32 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		return tx.Create(&task).Error
 	})
 	if err != nil {
-		httpx.Fail(w, r, httpx.Internal(err))
+		httpx.Fail(c, httpx.Internal(err))
 		return
 	}
 
-	httpx.Created(w, taskDTO{
+	httpx.Created(c, taskDTO{
 		ID: task.Code, ProjectID: a.Code, Name: task.Name,
 		PlannedStart: dateStr(task.PlannedStart), PlannedEnd: dateStr(task.PlannedEnd),
 		Status: task.Status, DependsOn: []string{}, AllowedActions: []string{"start"},
 	})
 }
 
-func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), false)
+func (s *Server) handleGetTask(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), false)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	code := normalizeTaskCode(a.Code, r.PathValue("taskCode"))
+	code := normalizeTaskCode(a.Code, c.Param("taskCode"))
 
-	d, detail, err := s.loadTaskDetail(r.Context(), a, code)
+	d, detail, err := s.loadTaskDetail(c.Request.Context(), a, code)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	httpx.OK(w, map[string]any{
+	httpx.OK(c, map[string]any{
 		"task":     d,
 		"waits_on": detail.Upstream,
 		"blocks":   detail.Downstream,
@@ -491,18 +491,18 @@ type updateTaskRequest struct {
 	PlannedEnd   *string `json:"planned_end"`
 }
 
-func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), false)
+func (s *Server) handleUpdateTask(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), false)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	code := normalizeTaskCode(a.Code, r.PathValue("taskCode"))
+	code := normalizeTaskCode(a.Code, c.Param("taskCode"))
 
 	var req updateTaskRequest
-	if err := decodeJSON(r, &req); err != nil {
-		httpx.Fail(w, r, err)
+	if err := decodeJSON(c, &req); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
 
@@ -510,7 +510,7 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 	if req.Name != nil {
 		name := strings.TrimSpace(*req.Name)
 		if name == "" {
-			httpx.Fail(w, r, httpx.BadRequest("name cannot be empty"))
+			httpx.Fail(c, httpx.BadRequest("name cannot be empty"))
 			return
 		}
 		updates["name"] = name
@@ -518,7 +518,7 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 	if req.PlannedStart != nil {
 		d, err := parseDate(*req.PlannedStart)
 		if err != nil {
-			httpx.Fail(w, r, httpx.BadRequest("planned_start must be a date in YYYY-MM-DD form"))
+			httpx.Fail(c, httpx.BadRequest("planned_start must be a date in YYYY-MM-DD form"))
 			return
 		}
 		updates["planned_start"] = d
@@ -526,39 +526,39 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 	if req.PlannedEnd != nil {
 		d, err := parseDate(*req.PlannedEnd)
 		if err != nil {
-			httpx.Fail(w, r, httpx.BadRequest("planned_end must be a date in YYYY-MM-DD form"))
+			httpx.Fail(c, httpx.BadRequest("planned_end must be a date in YYYY-MM-DD form"))
 			return
 		}
 		updates["planned_end"] = d
 	}
 	if len(updates) == 0 {
-		httpx.Fail(w, r, httpx.BadRequest("nothing to update"))
+		httpx.Fail(c, httpx.BadRequest("nothing to update"))
 		return
 	}
 
-	result := s.db.WithContext(r.Context()).Model(&database.Task{}).
+	result := s.db.WithContext(c.Request.Context()).Model(&database.Task{}).
 		Where("project_id = ? AND code = ?", a.ID, code).Updates(updates)
 	if result.Error != nil {
-		httpx.Fail(w, r, httpx.Internal(result.Error))
+		httpx.Fail(c, httpx.Internal(result.Error))
 		return
 	}
 	if result.RowsAffected == 0 {
-		httpx.Fail(w, r, httpx.NotFound("task not found"))
+		httpx.Fail(c, httpx.NotFound("task not found"))
 		return
 	}
-	s.handleGetTask(w, r)
+	s.handleGetTask(c)
 }
 
-func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), false)
+func (s *Server) handleDeleteTask(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), false)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	code := normalizeTaskCode(a.Code, r.PathValue("taskCode"))
+	code := normalizeTaskCode(a.Code, c.Param("taskCode"))
 
-	err = s.db.WithContext(r.Context()).Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
 		if err := lockProject(tx, a.ID); err != nil {
 			return err
 		}
@@ -574,26 +574,26 @@ func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 		return rebuildClosure(tx, a.ID)
 	})
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	httpx.NoContent(w)
+	httpx.NoContent(c)
 }
 
 // ---------------------------------------------------------------------------
 // status transitions
 // ---------------------------------------------------------------------------
 
-func (s *Server) transition(w http.ResponseWriter, r *http.Request, action string) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), false)
+func (s *Server) transition(c *gin.Context, action string) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), false)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	code := normalizeTaskCode(a.Code, r.PathValue("taskCode"))
+	code := normalizeTaskCode(a.Code, c.Param("taskCode"))
 
-	err = s.db.WithContext(r.Context()).Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
 		var task database.Task
 		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("project_id = ? AND code = ?", a.ID, code).Take(&task).Error
@@ -650,22 +650,22 @@ func (s *Server) transition(w http.ResponseWriter, r *http.Request, action strin
 		return httpx.BadRequest("unknown action")
 	})
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	s.handleGetTask(w, r)
+	s.handleGetTask(c)
 }
 
-func (s *Server) handleTaskStart(w http.ResponseWriter, r *http.Request) {
-	s.transition(w, r, "start")
+func (s *Server) handleTaskStart(c *gin.Context) {
+	s.transition(c, "start")
 }
 
-func (s *Server) handleTaskDone(w http.ResponseWriter, r *http.Request) {
-	s.transition(w, r, "done")
+func (s *Server) handleTaskDone(c *gin.Context) {
+	s.transition(c, "done")
 }
 
-func (s *Server) handleTaskReopen(w http.ResponseWriter, r *http.Request) {
-	s.transition(w, r, "reopen")
+func (s *Server) handleTaskReopen(c *gin.Context) {
+	s.transition(c, "reopen")
 }
 
 // ---------------------------------------------------------------------------
@@ -676,31 +676,31 @@ type addDependencyRequest struct {
 	DependsOn string `json:"depends_on"`
 }
 
-func (s *Server) handleAddDependency(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), false)
+func (s *Server) handleAddDependency(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), false)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	code := normalizeTaskCode(a.Code, r.PathValue("taskCode"))
+	code := normalizeTaskCode(a.Code, c.Param("taskCode"))
 
 	var req addDependencyRequest
-	if err := decodeJSON(r, &req); err != nil {
-		httpx.Fail(w, r, err)
+	if err := decodeJSON(c, &req); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
 	if strings.TrimSpace(req.DependsOn) == "" {
-		httpx.Fail(w, r, httpx.BadRequest("depends_on is required"))
+		httpx.Fail(c, httpx.BadRequest("depends_on is required"))
 		return
 	}
 	dependsOnCode := normalizeTaskCode(a.Code, req.DependsOn)
 	if code == dependsOnCode {
-		httpx.Fail(w, r, httpx.Unprocessable("a task cannot depend on itself"))
+		httpx.Fail(c, httpx.Unprocessable("a task cannot depend on itself"))
 		return
 	}
 
-	err = s.db.WithContext(r.Context()).Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
 		// One writer at a time per project: the cycle check and the closure insert
 		// must see each other, otherwise two concurrent edges can close a loop.
 		if err := lockProject(tx, a.ID); err != nil {
@@ -768,23 +768,23 @@ func (s *Server) handleAddDependency(w http.ResponseWriter, r *http.Request) {
 			a.ID, dependsOnID, dependsOnID, taskID, taskID).Error
 	})
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	s.handleGetTask(w, r)
+	s.handleGetTask(c)
 }
 
-func (s *Server) handleRemoveDependency(w http.ResponseWriter, r *http.Request) {
-	p := caller(r)
-	a, err := s.projectAccess(r.Context(), p, r.PathValue("projectCode"), false)
+func (s *Server) handleRemoveDependency(c *gin.Context) {
+	p := caller(c)
+	a, err := s.projectAccess(c.Request.Context(), p, c.Param("projectCode"), false)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	code := normalizeTaskCode(a.Code, r.PathValue("taskCode"))
-	depCode := normalizeTaskCode(a.Code, r.PathValue("dependsOnCode"))
+	code := normalizeTaskCode(a.Code, c.Param("taskCode"))
+	depCode := normalizeTaskCode(a.Code, c.Param("dependsOnCode"))
 
-	err = s.db.WithContext(r.Context()).Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
 		if err := lockProject(tx, a.ID); err != nil {
 			return err
 		}
@@ -817,15 +817,15 @@ func (s *Server) handleRemoveDependency(w http.ResponseWriter, r *http.Request) 
 		return rebuildClosure(tx, a.ID)
 	})
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	s.handleGetTask(w, r)
+	s.handleGetTask(c)
 }
 
 // handleGetTaskGraph is kept for the frontend that wants the graph on its own.
-func (s *Server) handleGetTaskGraph(w http.ResponseWriter, r *http.Request) {
-	s.handleGetTask(w, r)
+func (s *Server) handleGetTaskGraph(c *gin.Context) {
+	s.handleGetTask(c)
 }
 
 // rebuildClosure recomputes the transitive closure for one project with a
